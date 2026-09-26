@@ -24,6 +24,7 @@
         };
       in
       {
+        packages.demo = import ./demo.nix { inherit pkgs; };
         devShells.default =
           with pkgs;
           mkShell {
@@ -31,6 +32,8 @@
               rust-bin.stable.latest.default
               openssl
               pkg-config
+              python313
+              just
             ];
             shellHook = ''
               export PATH="$HOME/.cargo/bin:$PATH"
