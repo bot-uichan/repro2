@@ -15,6 +15,7 @@ pub struct Model {
     pub nar_size: i64,
     pub cache_url: Option<String>,
     pub created_at: DateTime,
+    pub user_id: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

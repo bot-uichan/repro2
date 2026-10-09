@@ -16,6 +16,23 @@ struct Cli {
     installable: String,
     #[arg(long, default_value = "http://127.0.0.1:3001")]
     registry_url: String,
+    /// Existing HTTP(S) binary cache serving this output; does not publish the build.
+    #[arg(long, value_parser = parse_cache_url)]
+    cache_url: Option<String>,
+}
+
+fn parse_cache_url(value: &str) -> Result<String, String> {
+    let url = reqwest::Url::parse(value).map_err(|_| "invalid cache URL".to_owned())?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || url.query().is_some()
+    {
+        return Err("cache URL must be HTTP(S), without credentials, query or fragment".into());
+    }
+    Ok(value.to_owned())
 }
 
 #[derive(Serialize)]
@@ -26,6 +43,7 @@ struct BuildReport<'a> {
     store_path: &'a str,
     nar_hash: &'a str,
     nar_size: i64,
+    cache_url: Option<&'a str>,
 }
 
 fn main() -> Result<()> {
@@ -68,6 +86,7 @@ fn main() -> Result<()> {
                 store_path: path,
                 nar_hash: &info.nar_hash,
                 nar_size: info.nar_size.try_into()?,
+                cache_url: cli.cache_url.as_deref(),
             };
             http.post(format!(
                 "{}/build-reports",
@@ -81,4 +100,46 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn report_serializes_optional_cache_location() {
+        let report = BuildReport {
+            drv_path: None,
+            output_name: "out",
+            store_path_hash: "abc",
+            store_path: "/nix/store/abc-example",
+            nar_hash: "sha256-example",
+            nar_size: 10,
+            cache_url: None,
+        };
+        let json = serde_json::to_value(report).unwrap();
+        assert!(json.as_object().unwrap().contains_key("cache_url"));
+        assert!(json["cache_url"].is_null());
+    }
+
+    #[test]
+    fn accepts_only_http_cache_publication_urls() {
+        for cache_url in ["https://cache.example/nix", "http://127.0.0.1:8080/"] {
+            assert!(
+                Cli::try_parse_from(["builder", "nixpkgs#hello", "--cache-url", cache_url]).is_ok()
+            );
+        }
+        for cache_url in [
+            "file:///etc/passwd",
+            "ftp://cache.example/",
+            "not a URL",
+            "https://user:password@cache.example/",
+            "https://cache.example/#fragment",
+        ] {
+            assert!(
+                Cli::try_parse_from(["builder", "nixpkgs#hello", "--cache-url", cache_url])
+                    .is_err()
+            );
+        }
+    }
 }
