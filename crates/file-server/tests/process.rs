@@ -47,6 +47,90 @@ async fn start(root: &Path, max_bytes: usize) -> (Process, String) {
     panic!("file-server did not become ready");
 }
 
+/// Observe the real startup syscalls rather than a mocked provisioning helper.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn binary_syncs_root_ancestry_before_binding_and_fails_closed_on_sync_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = dir.path().join("startup-sync.so");
+    let compiled = Command::new("cc")
+        .args(["-shared", "-fPIC", "-Wall", "-Wextra", "-Werror"])
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/startup_sync.c"))
+        .args(["-o"])
+        .arg(&probe)
+        .arg("-ldl")
+        .status()
+        .unwrap();
+    assert!(compiled.success(), "compile startup syscall probe");
+
+    let root = dir.path().join("private/blobs");
+    let expected: Vec<_> = root.ancestors().map(|path| path.to_owned()).collect();
+    // Check first provisioning, every ancestor's failure, then a retry after
+    // those failures with a now-existing hierarchy (existence is not durability).
+    let failures = std::iter::once(None)
+        .chain(expected.iter().map(Some))
+        .chain(std::iter::once(None));
+    for (attempt, failure) in failures.enumerate() {
+        let trace = dir.path().join(format!("trace-{attempt}"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_file-server"));
+        command
+            .env("FILE_SERVER_ROOT", &root)
+            .env("FILE_SERVER_BIND", "127.0.0.1:0")
+            .env("LD_PRELOAD", &probe)
+            .env("STARTUP_SYNC_TRACE", &trace)
+            .env_remove("STARTUP_SYNC_FAIL")
+            .stderr(std::process::Stdio::piped());
+        if let Some(path) = failure {
+            command.env("STARTUP_SYNC_FAIL", path);
+        }
+        let mut process = Process(command.spawn().unwrap());
+        let mut finished = false;
+        for _ in 0..200 {
+            let events = std::fs::read_to_string(&trace).unwrap_or_default();
+            if events.lines().any(|line| line == "BIND") || process.0.try_wait().unwrap().is_some()
+            {
+                finished = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(finished, "startup neither bound nor exited");
+        let events = std::fs::read_to_string(&trace).unwrap_or_default();
+        let actual: Vec<_> = events.lines().collect();
+        if let Some(path) = failure {
+            assert!(
+                !actual.contains(&"BIND"),
+                "startup bound despite fsync failure at {}: {actual:?}",
+                path.display()
+            );
+            assert!(
+                !process.0.wait().unwrap().success(),
+                "fsync failure must fail startup"
+            );
+            let mut stderr = String::new();
+            std::io::Read::read_to_string(process.0.stderr.as_mut().unwrap(), &mut stderr).unwrap();
+            assert!(stderr.contains("sync FILE_SERVER_ROOT"));
+            let stop = expected.iter().position(|entry| entry == path).unwrap();
+            let wanted: Vec<_> = expected[..=stop]
+                .iter()
+                .map(|entry| entry.to_str().unwrap())
+                .collect();
+            assert_eq!(actual, wanted);
+        } else {
+            let mut wanted: Vec<_> = expected
+                .iter()
+                .map(|entry| entry.to_str().unwrap())
+                .collect();
+            wanted.push("BIND");
+            assert_eq!(
+                actual, wanted,
+                "root and every ancestor must sync before bind"
+            );
+            assert!(process.0.try_wait().unwrap().is_none());
+        }
+    }
+}
+
 #[tokio::test]
 async fn binary_creates_owner_only_storage_directory() {
     use std::os::unix::fs::PermissionsExt;

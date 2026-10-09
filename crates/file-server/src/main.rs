@@ -24,6 +24,18 @@ async fn main() -> anyhow::Result<()> {
     let root = tokio::fs::canonicalize(&config.root)
         .await
         .context("resolve FILE_SERVER_ROOT")?;
+    let durable_root = root.clone();
+    tokio::task::spawn_blocking(move || {
+        // Persist every directory entry up to the filesystem root before bind.
+        // Include existing ancestors: a previous startup may have created them
+        // but failed fsync, so existence alone does not establish durability.
+        for directory in durable_root.ancestors() {
+            std::fs::File::open(directory)?.sync_all()?;
+        }
+        Ok::<_, std::io::Error>(())
+    })
+    .await?
+    .context("sync FILE_SERVER_ROOT ancestry")?;
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .context("bind file-server")?;
