@@ -10,6 +10,33 @@ use crate::store_path_hash::StorePathHash;
 pub struct NarInfoResponse(pub NarInfo);
 
 impl NarInfoResponse {
+    pub fn from_blob(
+        record: &crate::nar_record::NarRecord,
+        metadata: &nar_metadata::Metadata,
+        artifact: &nar_metadata::Artifact,
+        url: String,
+    ) -> anyhow::Result<Self> {
+        let info = NarInfo::builder(
+            record.store_path.clone(),
+            url,
+            record.nar_hash.clone(),
+            record.nar_size,
+        )
+        .compression(nix_narinfo::Compression::None)
+        .file_hash(Some(format!("sha256:{}", artifact.file_hash).parse()?))
+        .file_size(Some(artifact.file_size))
+        .references(
+            metadata
+                .references
+                .iter()
+                .map(|v| v.parse())
+                .collect::<Result<Vec<_>, _>>()?,
+        )
+        .deriver(metadata.deriver.as_ref().map(|v| v.parse()).transpose()?)
+        .build()?;
+        Ok(Self(info))
+    }
+
     pub fn from_upstream(upstream: NarInfo, url: String) -> Result<Self, anyhow::Error> {
         let info = NarInfo::builder_in(
             upstream.store_dir().clone(),

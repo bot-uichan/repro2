@@ -1,4 +1,5 @@
 use anyhow::Result;
+use nar_metadata::{Artifact, Metadata};
 use nix_derivation::{NixHash, StorePath};
 use nix_narinfo::NarInfo;
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,8 @@ pub struct RegistryNarRecord {
     pub nar_hash: String,
     pub nar_size: i64,
     pub cache_url: Option<String>,
+    pub metadata: Option<Metadata>,
+    pub artifact: Option<Artifact>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -28,12 +31,15 @@ pub struct NarRecord {
     pub nar_hash: NixHash,
     pub nar_size: u64,
     pub cache_url: String,
+    pub metadata: Option<Metadata>,
+    pub artifact: Option<Artifact>,
 }
 
 impl NarRecord {
     pub fn matches_result(&self, other: &Self) -> bool {
         self.drv_path == other.drv_path
             && self.output_name == other.output_name
+            && self.metadata == other.metadata
             && self.matches_nar(other)
     }
 
@@ -48,7 +54,18 @@ impl NarRecord {
 impl TryFrom<RegistryNarRecord> for NarRecord {
     type Error = anyhow::Error;
 
-    fn try_from(model: RegistryNarRecord) -> Result<Self, Self::Error> {
+    fn try_from(mut model: RegistryNarRecord) -> Result<Self, Self::Error> {
+        if let Some(metadata) = &mut model.metadata {
+            metadata.canonicalize();
+        }
+        nar_metadata::validate_candidate(
+            model.metadata.as_ref(),
+            model.artifact.as_ref(),
+            &model.store_path,
+            &model.store_path_hash,
+            &model.nar_hash,
+            model.nar_size,
+        )?;
         let store_path_hash = StorePathHash::try_from(model.store_path_hash)?;
         let store_path: StorePath = model.store_path.parse()?;
         anyhow::ensure!(
@@ -64,6 +81,8 @@ impl TryFrom<RegistryNarRecord> for NarRecord {
             nar_hash: model.nar_hash.parse()?,
             nar_size: model.nar_size.try_into()?,
             cache_url: model.cache_url.unwrap_or_default(),
+            metadata: model.metadata,
+            artifact: model.artifact,
         })
     }
 }
@@ -81,6 +100,8 @@ impl TryFrom<NarInfo> for NarRecord {
             nar_hash: value.nar_hash().clone(),
             nar_size: value.nar_size(),
             cache_url: value.url().to_owned(),
+            metadata: None,
+            artifact: None,
         })
     }
 }

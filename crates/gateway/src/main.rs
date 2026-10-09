@@ -27,6 +27,7 @@ struct AppState {
     registry_url: String,
     http: Client,
     required_users: NonZeroUsize,
+    blob_base_url: Option<url::Url>,
 }
 
 #[derive(Debug, Error)]
@@ -64,6 +65,30 @@ impl IntoResponse for NarInfoError {
     }
 }
 
+fn parse_blob_base_url(value: &str) -> anyhow::Result<url::Url> {
+    anyhow::ensure!(
+        !value.is_empty()
+            && !value.chars().any(|c| c.is_whitespace() || c.is_control())
+            && !value.contains(['\\', '%'])
+            && !value.split('/').any(|v| matches!(v, "." | "..")),
+        "unsafe blob base URL"
+    );
+    let mut url = url::Url::parse(value)?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none(),
+        "HTTP(S) base without credentials/query/fragment required"
+    );
+    if !url.path().ends_with('/') {
+        url.set_path(&format!("{}/", url.path()));
+    }
+    Ok(url)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let required_users = std::env::var("REQUIRED_USERS")
@@ -75,6 +100,11 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|_| "http://127.0.0.1:3001".to_owned()),
         http: Client::new(),
         required_users,
+        blob_base_url: std::env::var("BLOB_BASE_URL")
+            .ok()
+            .map(|v| parse_blob_base_url(&v))
+            .transpose()
+            .context("invalid BLOB_BASE_URL")?,
     };
 
     let app = Router::new()
@@ -112,8 +142,37 @@ async fn narinfo(
         .into_iter()
         .filter(|report| report.store_path_hash == narinfo_path.hash().as_str())
         .collect();
-    let record = select_report(reports, state.required_users)?;
+    let record =
+        select_report_for_backend(reports, state.required_users, state.blob_base_url.is_some())?;
 
+    if let (Some(base), Some(artifact), Some(metadata)) =
+        (&state.blob_base_url, &record.artifact, &record.metadata)
+    {
+        let url = base.join(&format!("nar/{}.nar", artifact.file_hash))?;
+        let available = state.http.head(url.clone()).send().await?;
+        if available.status() == StatusCode::NOT_FOUND {
+            return Err(NarInfoError::NotFound);
+        }
+        let available = available.error_for_status()?;
+        if available
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            != Some(artifact.file_size)
+        {
+            return Err(NarInfoError::NotFound);
+        }
+        return Ok(NarInfoResponse::from_blob(
+            &record,
+            metadata,
+            artifact,
+            url.to_string(),
+        )?);
+    }
+    if record.cache_url.is_empty() {
+        return Err(NarInfoError::NotFound);
+    }
     let cache_server = CacheServer::try_from(record.cache_url.as_str())?;
     let server_info = cache_server
         .fetch_narinfo(&state.http, &record.store_path_hash)
@@ -124,6 +183,20 @@ async fn narinfo(
         return Err(NarInfoError::NotFound);
     }
 
+    if let Some(metadata) = &record.metadata {
+        let mut upstream_metadata = nar_metadata::Metadata {
+            references: server_info
+                .references()
+                .iter()
+                .map(|p| p.to_absolute_path())
+                .collect(),
+            deriver: server_info.deriver().map(|p| p.to_absolute_path()),
+        };
+        upstream_metadata.canonicalize();
+        if metadata != &upstream_metadata {
+            return Err(NarInfoError::NotFound);
+        }
+    }
     Ok(NarInfoResponse::from_upstream(
         server_info,
         nar_url.to_string(),
@@ -131,9 +204,18 @@ async fn narinfo(
 }
 
 // Implementation detail: choose the lexicographically first qualifying result/cache.
+#[cfg(test)]
 fn select_report(
     reports: Vec<RegistryNarRecord>,
     required_users: NonZeroUsize,
+) -> Result<NarRecord, NarInfoError> {
+    select_report_for_backend(reports, required_users, true)
+}
+
+fn select_report_for_backend(
+    reports: Vec<RegistryNarRecord>,
+    required_users: NonZeroUsize,
+    blob_enabled: bool,
 ) -> Result<NarRecord, NarInfoError> {
     // Invalid report metadata cannot vote and must not veto other users' results.
     let mut records = reports
@@ -148,13 +230,17 @@ fn select_report(
             record.store_path.to_basename(),
             record.nar_hash.to_sri_string(),
             record.nar_size,
+            record.metadata.clone(),
+            // Within one result, prefer direct blob publication when configured.
+            !(blob_enabled && record.artifact.is_some()),
             record.cache_url.clone(),
         )
     });
     let winner = records
         .iter()
         .position(|record| {
-            if record.cache_url.is_empty()
+            if (record.cache_url.is_empty()
+                && (!blob_enabled || record.artifact.is_none() || record.metadata.is_none()))
                 || record
                     .user_id
                     .as_deref()
@@ -231,6 +317,8 @@ mod tests {
             nar_hash: NAR_HASH.to_owned(),
             nar_size: NAR_SIZE,
             cache_url: Some(cache_url),
+            metadata: None,
+            artifact: None,
         };
         mock_registry_reports(vec![
             record.clone(),
@@ -256,6 +344,119 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         registry_url
+    }
+
+    #[test]
+    fn candidate_selection_is_stable_across_registry_row_order() {
+        let first: RegistryNarRecord = serde_json::from_value(serde_json::json!({
+            "user_id":"alice", "store_path_hash":STORE_PATH_HASH,"store_path":STORE_PATH,
+            "nar_hash":"sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","nar_size":10,
+            "metadata":{"references":[STORE_PATH],"deriver":null},
+            "artifact":{"file_hash":"0000000000000000000000000000000000000000000000000000000000000000","file_size":10,"compression":"none"}
+        })).unwrap();
+        let mut second = first.clone();
+        second.metadata.as_mut().unwrap().references.clear();
+        let threshold = NonZeroUsize::new(1).unwrap();
+        let forward = select_report(vec![first.clone(), second.clone()], threshold).unwrap();
+        let reverse = select_report(vec![second, first], threshold).unwrap();
+        assert_eq!(forward.metadata, reverse.metadata);
+    }
+
+    #[test]
+    fn configured_blob_backend_prefers_artifact_for_the_same_qualifying_candidate() {
+        let with_artifact: RegistryNarRecord = serde_json::from_value(serde_json::json!({
+            "user_id": "alice", "store_path_hash": STORE_PATH_HASH, "store_path": STORE_PATH,
+            "nar_hash": "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "nar_size": 10,
+            "cache_url": "https://cache.example/", "metadata": {"references": [], "deriver": null},
+            "artifact": {"file_hash": "0".repeat(64), "file_size": 10, "compression": "none"}
+        }))
+        .unwrap();
+        let mut cache_only = with_artifact.clone();
+        cache_only.user_id = Some("bob".into());
+        cache_only.artifact = None;
+        for reports in [
+            vec![cache_only.clone(), with_artifact.clone()],
+            vec![with_artifact, cache_only],
+        ] {
+            let selected =
+                select_report_for_backend(reports, NonZeroUsize::new(2).unwrap(), true).unwrap();
+            assert!(
+                selected.artifact.is_some(),
+                "registry row order selected legacy over the agreed blob"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_reference_sets_agree_without_artifact_location_votes() {
+        let a = format!("/nix/store/{STORE_PATH_HASH}-a");
+        let b = format!("/nix/store/{STORE_PATH_HASH}-b");
+        let report = serde_json::json!({
+            "user_id":"alice", "store_path_hash":STORE_PATH_HASH,"store_path":STORE_PATH,
+            "nar_hash":"sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","nar_size":10,
+            "metadata":{"references":[b,a,a],"deriver":null},
+            "artifact":{"file_hash":"0000000000000000000000000000000000000000000000000000000000000000","file_size":10,"compression":"none"}
+        });
+        let first: RegistryNarRecord = serde_json::from_value(report.clone()).unwrap();
+        let mut second = report;
+        second["user_id"] = "bob".into();
+        second["artifact"] = serde_json::Value::Null;
+        second["metadata"]["references"] = serde_json::json!([a, b]);
+        let second: RegistryNarRecord = serde_json::from_value(second).unwrap();
+        assert!(
+            select_report(
+                vec![first.clone(), second.clone()],
+                NonZeroUsize::new(2).unwrap()
+            )
+            .is_ok()
+        );
+        let mut dissent = second.clone();
+        dissent.metadata.as_mut().unwrap().references.clear();
+        assert!(matches!(
+            select_report(vec![first.clone(), dissent], NonZeroUsize::new(2).unwrap()),
+            Err(NarInfoError::NotFound)
+        ));
+        let mut dissent = second;
+        dissent.metadata.as_mut().unwrap().deriver =
+            Some(format!("/nix/store/{STORE_PATH_HASH}-different.drv"));
+        assert!(matches!(
+            select_report(vec![first, dissent], NonZeroUsize::new(2).unwrap()),
+            Err(NarInfoError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn invalid_artifact_metadata_from_registry_cannot_be_selected() {
+        let report = serde_json::json!({
+            "user_id":"alice", "store_path_hash":STORE_PATH_HASH, "store_path":STORE_PATH,
+            "nar_hash":"sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "nar_size":10,
+            "metadata":{"references":[],"deriver":null},
+            "artifact":{"file_hash":"0000000000000000000000000000000000000000000000000000000000000000","file_size":10,"compression":"none"}
+        });
+        for (pointer, value) in [
+            ("/artifact/compression", serde_json::json!("xz")),
+            ("/artifact/file_hash", serde_json::json!("../escape")),
+            ("/artifact/file_hash", serde_json::json!("1".repeat(64))),
+            ("/artifact/file_size", serde_json::json!(11)),
+            ("/metadata", serde_json::Value::Null),
+            (
+                "/metadata/references",
+                serde_json::json!(["evil\nURL: evil"]),
+            ),
+        ] {
+            let mut invalid = report.clone();
+            *invalid.pointer_mut(pointer).unwrap() = value;
+            assert!(
+                matches!(
+                    select_report(
+                        vec![serde_json::from_value(invalid).unwrap()],
+                        NonZeroUsize::new(1).unwrap()
+                    ),
+                    Err(NarInfoError::NotFound)
+                ),
+                "{pointer}"
+            );
+        }
     }
 
     #[test]
@@ -427,6 +628,7 @@ mod tests {
         let state = AppState {
             registry_url: mock_registry_reports(vec![record]).await,
             http: Client::new(),
+            blob_base_url: None,
             required_users: NonZeroUsize::new(1).unwrap(),
         };
         let path = NarInfoPath::try_from(format!("{STORE_PATH_HASH}.narinfo")).unwrap();
@@ -462,6 +664,7 @@ mod tests {
             let state = AppState {
                 registry_url: mock_registry_reports(vec![record, second]).await,
                 http: Client::new(),
+                blob_base_url: None,
                 required_users: NonZeroUsize::new(2).unwrap(),
             };
             let path = NarInfoPath::try_from(format!("{STORE_PATH_HASH}.narinfo")).unwrap();
@@ -473,11 +676,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_cache_must_match_agreed_references_and_deriver_when_present() {
+        for metadata in [
+            serde_json::json!({"references":[STORE_PATH],"deriver":null}),
+            serde_json::json!({"references":[],"deriver":format!("/nix/store/{STORE_PATH_HASH}-hello.drv")}),
+        ] {
+            let record: RegistryNarRecord = serde_json::from_value(serde_json::json!({
+                "user_id":"alice", "store_path_hash":STORE_PATH_HASH,"store_path":STORE_PATH,
+                "nar_hash":NAR_HASH,"nar_size":NAR_SIZE,"metadata":metadata,"cache_url":mock_cache().await,
+            })).unwrap();
+            let state = AppState {
+                registry_url: mock_registry_reports(vec![record]).await,
+                http: Client::new(),
+                required_users: NonZeroUsize::new(1).unwrap(),
+                blob_base_url: None,
+            };
+            let path = NarInfoPath::try_from(format!("{STORE_PATH_HASH}.narinfo")).unwrap();
+            assert!(matches!(
+                narinfo(State(state), Path(path)).await,
+                Err(NarInfoError::NotFound)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_blob_backend_does_not_hide_an_available_legacy_cache() {
+        let cache_url = mock_cache().await;
+        let record: RegistryNarRecord = serde_json::from_value(serde_json::json!({
+            "user_id":"alice", "store_path_hash":STORE_PATH_HASH,"store_path":STORE_PATH,
+            "nar_hash":NAR_HASH,"nar_size":NAR_SIZE,
+            "metadata":{"references":[],"deriver":null},
+            "artifact":{"file_hash":"ad2d2a12a11702bc6701dcf136436ffb83da1f15dc43f25d3742a392eaba5d26","file_size":NAR_SIZE,"compression":"none"}
+        })).unwrap();
+        let mut second = record.clone();
+        second.user_id = Some("bob".into());
+        second.artifact = None;
+        second.cache_url = Some(cache_url);
+        let state = AppState {
+            registry_url: mock_registry_reports(vec![record, second]).await,
+            http: Client::new(),
+            required_users: NonZeroUsize::new(2).unwrap(),
+            blob_base_url: None,
+        };
+        let path = NarInfoPath::try_from(format!("{STORE_PATH_HASH}.narinfo")).unwrap();
+        assert!(narinfo(State(state), Path(path)).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn returns_narinfo_when_registry_and_upstream_records_match() {
         let cache_url = mock_cache().await;
         let state = AppState {
             registry_url: mock_registry(cache_url.clone()).await,
             http: Client::new(),
+            blob_base_url: None,
             required_users: NonZeroUsize::new(2).unwrap(),
         };
         let path = NarInfoPath::try_from(format!("{STORE_PATH_HASH}.narinfo")).unwrap();
@@ -499,6 +750,7 @@ mod tests {
         let state = AppState {
             registry_url: mock_registry(mock_missing_cache().await).await,
             http: Client::new(),
+            blob_base_url: None,
             required_users: NonZeroUsize::new(2).unwrap(),
         };
         let path = NarInfoPath::try_from(format!("{STORE_PATH_HASH}.narinfo")).unwrap();
@@ -523,6 +775,8 @@ mod tests {
             nar_hash: NAR_HASH.to_owned(),
             nar_size: NAR_SIZE,
             cache_url: Some(cache_url.clone()),
+            metadata: None,
+            artifact: None,
         };
         let other = RegistryNarRecord {
             user_id: Some("charlie@example.com".into()),
@@ -542,6 +796,7 @@ mod tests {
         let state = AppState {
             registry_url,
             http: Client::new(),
+            blob_base_url: None,
             required_users: NonZeroUsize::new(2).unwrap(),
         };
         let path = NarInfoPath::try_from(format!("{STORE_PATH_HASH}.narinfo")).unwrap();
@@ -571,6 +826,8 @@ mod tests {
             nar_hash: NAR_HASH.to_owned(),
             nar_size: NAR_SIZE,
             cache_url: Some("https://first.example/".to_owned()),
+            metadata: None,
+            artifact: None,
         };
         let matching = RegistryNarRecord {
             user_id: Some("bob@example.com".into()),
@@ -600,6 +857,8 @@ mod tests {
             nar_hash: NAR_HASH.to_owned(),
             nar_size: NAR_SIZE,
             cache_url: Some("http://127.0.0.1:1/".to_owned()),
+            metadata: None,
+            artifact: None,
         };
         let other = RegistryNarRecord {
             user_id: Some("charlie@example.com".into()),
@@ -609,6 +868,7 @@ mod tests {
         let state = AppState {
             registry_url: mock_registry_reports(vec![record, other]).await,
             http: Client::new(),
+            blob_base_url: None,
             required_users: NonZeroUsize::new(2).unwrap(),
         };
         let path = NarInfoPath::try_from(format!("{STORE_PATH_HASH}.narinfo")).unwrap();

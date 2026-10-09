@@ -1175,6 +1175,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "nar-metadata",
  "nix-derivation",
  "nix-narinfo",
  "reqwest",
@@ -1905,6 +1906,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nar-metadata"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "nix-derivation",
+ "serde",
+]
+
+[[package]]
 name = "nix"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2383,9 +2393,11 @@ dependencies = [
  "axum",
  "log",
  "migration",
+ "nar-metadata",
  "reqwest",
  "sea-orm",
  "serde",
+ "serde_json",
  "tokio",
  "url",
 ]

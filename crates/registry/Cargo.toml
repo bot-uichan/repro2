@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+nar-metadata = { path = "../nar-metadata" }
+serde_json = "1.0.145"
 anyhow = "1.0.104"
 axum = "0.8.9"
 log = "0.4.34"

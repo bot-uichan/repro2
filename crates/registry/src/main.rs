@@ -6,6 +6,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
+use nar_metadata::{Artifact, Metadata};
 use sea_orm::{
     ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set, sea_query::OnConflict,
 };
@@ -24,6 +25,8 @@ struct NarRecord {
     nar_hash: String,
     nar_size: i64,
     cache_url: Option<String>,
+    metadata: Option<Metadata>,
+    artifact: Option<Artifact>,
 }
 
 #[derive(Deserialize)]
@@ -35,11 +38,15 @@ struct BuildReport {
     nar_hash: String,
     nar_size: i64,
     cache_url: Option<String>,
+    metadata: Option<Metadata>,
+    artifact: Option<Artifact>,
 }
 
-impl From<build_reports::Model> for NarRecord {
-    fn from(model: build_reports::Model) -> Self {
-        Self {
+impl TryFrom<build_reports::Model> for NarRecord {
+    type Error = serde_json::Error;
+
+    fn try_from(model: build_reports::Model) -> Result<Self, Self::Error> {
+        Ok(Self {
             user_id: model.user_id,
             id: model.id,
             drv_path: model.drv_path,
@@ -49,7 +56,15 @@ impl From<build_reports::Model> for NarRecord {
             nar_hash: model.nar_hash,
             nar_size: model.nar_size,
             cache_url: model.cache_url,
-        }
+            metadata: model
+                .metadata
+                .map(|v| serde_json::from_str(&v))
+                .transpose()?,
+            artifact: model
+                .artifact
+                .map(|v| serde_json::from_str(&v))
+                .transpose()?,
+        })
     }
 }
 
@@ -69,8 +84,11 @@ async fn main() {
 async fn create_build_report(
     State(db): State<DatabaseConnection>,
     headers: HeaderMap,
-    Json(report): Json<BuildReport>,
+    Json(mut report): Json<BuildReport>,
 ) -> Result<StatusCode, StatusCode> {
+    if headers.get_all("Tailscale-User-Login").iter().count() != 1 {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
     let user_id = headers
         .get("Tailscale-User-Login")
         .and_then(|value| value.to_str().ok())
@@ -88,6 +106,18 @@ async fn create_build_report(
             return Err(StatusCode::BAD_REQUEST);
         }
     }
+    report.nar_hash = nar_metadata::validate_candidate(
+        report.metadata.as_ref(),
+        report.artifact.as_ref(),
+        &report.store_path,
+        &report.store_path_hash,
+        &report.nar_hash,
+        report.nar_size,
+    )
+    .map_err(|_| StatusCode::BAD_REQUEST)?;
+    if let Some(metadata) = &mut report.metadata {
+        metadata.canonicalize();
+    }
     BuildReports::insert(build_reports::ActiveModel {
         user_id: Set(Some(user_id.to_owned())),
         drv_path: Set(report.drv_path),
@@ -97,11 +127,20 @@ async fn create_build_report(
         nar_hash: Set(report.nar_hash),
         nar_size: Set(report.nar_size),
         cache_url: Set(report.cache_url),
+        metadata: Set(report
+            .metadata
+            .map(|v| serde_json::to_string(&v).expect("metadata JSON"))),
+        artifact: Set(report
+            .artifact
+            .map(|v| serde_json::to_string(&v).expect("artifact JSON"))),
         ..Default::default()
     })
     .on_conflict(
         OnConflict::new()
-            .update_column(build_reports::Column::CacheUrl)
+            .update_columns([
+                build_reports::Column::CacheUrl,
+                build_reports::Column::Artifact,
+            ])
             .to_owned(),
     )
     .exec(&db)
@@ -128,7 +167,15 @@ async fn nar_info(
     if models.is_empty() {
         return Err(StatusCode::NOT_FOUND);
     }
-    Ok(Json(models.into_iter().map(Into::into).collect()))
+    let reports = models
+        .into_iter()
+        .map(NarRecord::try_from)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            eprintln!("stored candidate metadata error: {error}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(Json(reports))
 }
 
 #[cfg(test)]
@@ -136,6 +183,181 @@ mod tests {
     use super::*;
     use migration::{Migrator, MigratorTrait};
     use sea_orm::{ConnectionTrait, Database};
+
+    #[tokio::test]
+    async fn round_trips_candidate_metadata_and_updates_artifact_without_an_extra_vote() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new()
+            .route("/build-reports", post(create_build_report))
+            .route("/nar-info/{hash}", get(nar_info))
+            .with_state(db.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let http = reqwest::Client::new();
+        let report = r#"{"output_name":"out","store_path_hash":"y1a49lg2ja68djssigz14lhdxvxcwbxa","store_path":"/nix/store/y1a49lg2ja68djssigz14lhdxvxcwbxa-hello","nar_hash":"sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","nar_size":10,"metadata":{"references":[],"deriver":null},"artifact":{"file_hash":"0000000000000000000000000000000000000000000000000000000000000000","file_size":10,"compression":"none"}}"#;
+        for body in [report.replace(",\"artifact\":{\"file_hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"file_size\":10,\"compression\":\"none\"}", ""), report.into()] {
+            assert_eq!(http.post(format!("{url}/build-reports"))
+                .header("Tailscale-User-Login", "alice@example.com")
+                .header("content-type", "application/json").body(body)
+                .send().await.unwrap().status(), StatusCode::CREATED);
+        }
+        let body = http
+            .get(format!("{url}/nar-info/y1a49lg2ja68djssigz14lhdxvxcwbxa"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            body.contains("\"metadata\":{\"references\":[],\"deriver\":null}"),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "\"file_hash\":\"0000000000000000000000000000000000000000000000000000000000000000\""
+            ),
+            "{body}"
+        );
+        assert_eq!(BuildReports::find().all(&db).await.unwrap().len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn rejects_unsafe_or_inconsistent_candidate_metadata() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let report = serde_json::json!({
+            "output_name":"out", "store_path_hash":"y1a49lg2ja68djssigz14lhdxvxcwbxa",
+            "store_path":"/nix/store/y1a49lg2ja68djssigz14lhdxvxcwbxa-hello",
+            "nar_hash":"sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "nar_size":10,
+            "metadata":{"references":[],"deriver":null},
+            "artifact":{"file_hash":"0000000000000000000000000000000000000000000000000000000000000000","file_size":10,"compression":"none"}
+        });
+        for (pointer, value) in [
+            ("/artifact/compression", serde_json::json!("xz")),
+            ("/artifact/file_hash", serde_json::json!("../escape")),
+            ("/artifact/file_hash", serde_json::json!("1".repeat(64))),
+            ("/artifact/file_hash", serde_json::json!("A".repeat(64))),
+            ("/artifact/file_size", serde_json::json!(11)),
+            ("/metadata", serde_json::Value::Null),
+            (
+                "/metadata/references",
+                serde_json::json!(["evil\nURL: https://evil.example/"]),
+            ),
+            (
+                "/metadata/references",
+                serde_json::json!(["y1a49lg2ja68djssigz14lhdxvxcwbxa-hello"]),
+            ),
+            (
+                "/metadata/deriver",
+                serde_json::json!("/nix/store/y1a49lg2ja68djssigz14lhdxvxcwbxa-not-a-drv"),
+            ),
+            (
+                "/store_path_hash",
+                serde_json::json!("00000000000000000000000000000000"),
+            ),
+            ("/nar_size", serde_json::json!(-1)),
+        ] {
+            let mut invalid = report.clone();
+            *invalid.pointer_mut(pointer).unwrap() = value;
+            let headers = HeaderMap::from_iter([(
+                "Tailscale-User-Login".parse().unwrap(),
+                "alice".parse().unwrap(),
+            )]);
+            assert_eq!(
+                create_build_report(
+                    State(db.clone()),
+                    headers,
+                    Json(serde_json::from_value(invalid).unwrap())
+                )
+                .await
+                .err(),
+                Some(StatusCode::BAD_REQUEST),
+                "{pointer}"
+            );
+        }
+        assert!(BuildReports::find().all(&db).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn canonicalizes_reference_sets_without_merging_metadata_variants() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let a = "/nix/store/y1a49lg2ja68djssigz14lhdxvxcwbxa-a";
+        let b = "/nix/store/y1a49lg2ja68djssigz14lhdxvxcwbxa-b";
+        for references in [vec![b, a, a], vec![a, b], vec![a]] {
+            let report = serde_json::json!({
+                "output_name":"out", "store_path_hash":"y1a49lg2ja68djssigz14lhdxvxcwbxa",
+                "store_path":"/nix/store/y1a49lg2ja68djssigz14lhdxvxcwbxa-hello",
+                "nar_hash":"sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "nar_size":10,
+                "metadata":{"references":references,"deriver":null}
+            });
+            create_build_report(
+                State(db.clone()),
+                HeaderMap::from_iter([(
+                    "Tailscale-User-Login".parse().unwrap(),
+                    "alice".parse().unwrap(),
+                )]),
+                Json(serde_json::from_value(report).unwrap()),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(BuildReports::find().all(&db).await.unwrap().len(), 2);
+        let Json(reports) = nar_info(State(db), Path("y1a49lg2ja68djssigz14lhdxvxcwbxa".into()))
+            .await
+            .unwrap();
+        assert!(
+            reports
+                .iter()
+                .any(|r| r.metadata.as_ref().unwrap().references == [a, b])
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_identity_headers_never_create_a_report() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let report: BuildReport = serde_json::from_value(serde_json::json!({
+            "output_name":"out", "store_path_hash":"abc", "store_path":"/nix/store/abc-example",
+            "nar_hash":"sha256-example", "nar_size":10
+        }))
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.append("Tailscale-User-Login", "alice".parse().unwrap());
+        headers.append("Tailscale-User-Login", "bob".parse().unwrap());
+        assert_eq!(
+            create_build_report(State(db.clone()), headers, Json(report))
+                .await
+                .err(),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+        assert!(BuildReports::find().all(&db).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn candidate_migration_refuses_lossy_downgrade() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        db.execute_unprepared("INSERT INTO build_reports (store_path_hash,store_path,nar_hash,nar_size,user_id,metadata) VALUES ('abc','/nix/store/abc-example','sha256-old',10,'alice','{\"references\":[],\"deriver\":null}')").await.unwrap();
+        assert!(Migrator::down(&db, Some(1)).await.is_err());
+        let Json(reports) = nar_info(State(db), Path("abc".into())).await.unwrap();
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].metadata.is_some());
+    }
+
+    #[tokio::test]
+    async fn corrupt_stored_metadata_returns_server_error_without_inventing_a_candidate() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        db.execute_unprepared("INSERT INTO build_reports (store_path_hash,store_path,nar_hash,nar_size,metadata) VALUES ('abc','/nix/store/abc-example','sha256-old',10,'invalid-json')").await.unwrap();
+        let result =
+            tokio::spawn(async move { nar_info(State(db), Path("abc".into())).await }).await;
+        assert!(matches!(result, Ok(Err(StatusCode::INTERNAL_SERVER_ERROR))));
+    }
 
     #[tokio::test]
     async fn rejects_report_without_authenticated_user() {
@@ -168,6 +390,8 @@ mod tests {
             nar_hash: "sha256-example".into(),
             nar_size: 10,
             cache_url: None,
+            metadata: None,
+            artifact: None,
         };
         let headers = HeaderMap::from_iter([(
             "Tailscale-User-Login".parse().unwrap(),
@@ -232,6 +456,8 @@ mod tests {
                 nar_hash: "sha256-example".into(),
                 nar_size: 10,
                 cache_url: None,
+                metadata: None,
+                artifact: None,
             };
             let headers = HeaderMap::from_iter([(
                 "Tailscale-User-Login".parse().unwrap(),
@@ -263,6 +489,8 @@ mod tests {
                 nar_hash: "sha256-example".into(),
                 nar_size: 10,
                 cache_url: Some(cache_url.into()),
+                metadata: None,
+                artifact: None,
             };
             let headers = HeaderMap::from_iter([(
                 "Tailscale-User-Login".parse().unwrap(),
@@ -295,6 +523,8 @@ mod tests {
                 nar_hash: "sha256-example".into(),
                 nar_size: 10,
                 cache_url: None,
+                metadata: None,
+                artifact: None,
             };
             let headers = HeaderMap::from_iter([("Tailscale-User-Login".parse().unwrap(), value)]);
             assert_eq!(
@@ -332,6 +562,8 @@ mod tests {
                 nar_hash: "sha256-example".into(),
                 nar_size: 10,
                 cache_url: None,
+                metadata: None,
+                artifact: None,
             };
             let headers = HeaderMap::from_iter([(
                 "Tailscale-User-Login".parse().unwrap(),
@@ -375,6 +607,8 @@ mod tests {
             nar_hash: "sha256-example".to_owned(),
             nar_size: 10,
             cache_url: None,
+            metadata: None,
+            artifact: None,
         };
 
         assert_eq!(

@@ -9,13 +9,22 @@ pub struct Model {
     pub id: i64,
     pub drv_path: Option<String>,
     pub output_name: Option<String>,
+    #[sea_orm(unique_key = "idx_build_reports_user_result")]
     pub store_path_hash: String,
+    #[sea_orm(unique_key = "idx_build_reports_user_result")]
     pub store_path: String,
+    #[sea_orm(unique_key = "idx_build_reports_user_result")]
     pub nar_hash: String,
+    #[sea_orm(unique_key = "idx_build_reports_user_result")]
     pub nar_size: i64,
     pub cache_url: Option<String>,
     pub created_at: DateTime,
+    #[sea_orm(unique_key = "idx_build_reports_user_result")]
     pub user_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub metadata: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub artifact: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

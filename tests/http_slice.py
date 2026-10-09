@@ -75,6 +75,7 @@ class MockCache(BaseHTTPRequestHandler):
 def main():
     for port in (3000, 3001):
         with socket.socket() as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             probe.bind(("127.0.0.1", port))
     for binary in ("migration", "registry", "gateway"):
         assert (ROOT / "target/debug" / binary).is_file(), "run cargo build --workspace first"
