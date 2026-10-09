@@ -65,6 +65,46 @@ cargo run -p builder -- 'nixpkgs#hello' \
 
 `--cache-url` を省略すると、cache location なしの報告になります。builder はビルド結果を static cache へコピー・公開しません。既存 builder のビルド設定（substitution を許可）は変更していないため、このスライスだけでは独立再ビルドの証明になりません。
 
+## CA NAR blob file-server（phase 1）
+
+`file-server` はローカル filesystem 上の **content-addressed blob 配信だけ**を追加します。既存 builder / registry / gateway の挙動は変更しません。hook、GC-protected queue、resident retry sender、IA store path → 複数 NAR candidate の registry schema、gateway の直接 blob URL narinfo 生成は **後続 phase・未実装**です。
+
+### HTTP protocol
+
+- **`PUT /nar/{sha256-lowercase-hex}.nar`**: uncompressed NAR bytes を送ります。key は受信した **bytes 全体の SHA256**（64 文字 lowercase hex）です。Nix base32 / SRI / store path hash ではありません。future narinfo は `Compression: none`、同じ bytes の `FileHash` / `NarHash` と size を使います。
+- 初回 upload は **201**。同じ bytes の再送は **200**（inode / mtime を変更しません）。同時送信でも完成した file だけを no-clobber publish し、上書きしません。
+- malformed key / encoded path separator / traversal は **400**。hash mismatch は **422**（既存 blob にも触れません）。既存 entry の内容が異なる、symlink / directory 等の場合は **409**。storage I/O failure は **500**。
+- upload には trusted proxy が設定した単一の非空 `Tailscale-User-Login` が必要です。未設定・空白・non-text・重複 header は **401**。
+- **`GET /nar/{sha256-lowercase-hex}.nar`**: bytes を直接 streaming download します（`Content-Type: application/x-nix-nar`、`Content-Length`）。**HEAD** も対応します。存在しない valid key は **404**。download 自体は user header を要求しません。read access は Serve / tailnet ACL で制限してください。
+- upload / download は streaming です。known `Content-Length` と実受信 bytes の両方で upload limit を検査し、chunked upload も limit 超過は **413**。upload 中の file は final URL に露出しません。通常の失敗・cancel では temporary file を削除します。
+
+この phase は **NAR syntax / store-path semantics を parse しません**。opaque bytes を hash-validate して保存する transport です。送信者は実 NAR を送る必要があり、NAR metadata の整合性・採用判断は後続 phase が担当します。配信時の再 hash は行わないため、運用者による disk 改変・bit rot はこの phase の保証外です。
+
+### Configuration and deployment boundary
+
+```sh
+FILE_SERVER_ROOT='/path/to/private/blobs' \
+FILE_SERVER_BIND='127.0.0.1:3002' \
+FILE_SERVER_MAX_UPLOAD_BYTES='536870912' \
+cargo run -p file-server
+```
+
+`FILE_SERVER_ROOT` は必須・非空。未作成 directory は mode **0700** で作成し、既存 directory の permissions は変更しません。bind の default は `127.0.0.1:3002`、upload limit の default は **536870912 bytes**。limit は正の `u64`。不正 config は listen 前に失敗します。bind は IPv4 / IPv6 **loopback のみ**を許可します。
+
+**Linux / Unix の信頼する local filesystem と専用 service account を前提**とします。root と親 directories を service account 所有・他ユーザー書き込み不可にし、既存 root も mode 0700 にしてください。symlink / nonregular blob は拒否しますが、host 管理者・同一 user の悪意ある disk mutation への sandbox ではありません。ファイルの no-clobber publication を提供できる local filesystem を使用し、NFS / untrusted network filesystem に配置しないでください。
+
+本番では **Tailscale Serve の HTTP reverse proxy 経由だけ**で公開し、tailnet grants / ACL で upload / read を許可するユーザーを限定してください。identity header の値自体は署名認証ではありません。loopback でも同一 host の任意 process は偽装できるため、local users / host operator は信頼境界内です。別 proxy を使うなら外部 identity header を必ず破棄し、認証済み identity だけを付け直してください。Funnel、公開 listener、外部から backend に直接接続できる forwarding は禁止です。tagged devices は user identity upload として未対応です。
+
+Serve の運用例（実装・test は実行しません）:
+
+```sh
+tailscale serve 3002
+```
+
+Serve の仕様は既存の [official identity-header documentation](https://tailscale.com/docs/features/tailscale-serve#identity-headers) を参照してください。この phase は per-user authorization / quota、global storage quota、concurrency cap、request timeout、blob GC は実装しません。trusted uploader と deployment の disk quota / rate limit / timeout で resource exhaustion を抑制してください。upload 完了後の process kill / restart の persistence は検証していますが、power loss の durability・crash 時の temp-file scavenging は保証しません。crash 後の dot-prefixed temp files の削除は server を止めて運用者が行ってください。
+
+`cargo test -p file-server` は real local HTTP listener と生成した valid uncompressed regular-file NAR bytes を使用します。process tests は実バイナリを起動し、config / private-root 作成 / upload limit / restart 後の GET・HEAD・dedup を検証します。実 Nix command や実 tailnet / Serve deployment の検証ではありません。
+
 ## 検証
 
 ```sh
