@@ -155,7 +155,54 @@ gateway は file-server へ **HEAD** を送り、存在と `Content-Length == Fi
 
 [official Nix post-build-hook semantics](https://nix.dev/manual/nix/2.24/advanced-topics/post-build-hook) では hook が build loop を block し、nonzero exit が loop を終了することを説明しています。[official GC-root semantics](https://nix.dev/manual/nix/2.24/package-management/garbage-collector-roots) に従い、`gcroots` 内の subdirectories に direct symlinks を置きます。hook 内で `nix-store --realise` 等を呼び出して daemon / recursive hook を待つ方法は使いません。
 
-### Setup once（運用例、テストは host に適用しません）
+### NixOS: flake input で宣言的に有効化（推奨）
+
+GitHub の flake input を追加し、module を import して enable / 2 つの Serve endpoints を設定します。既存の `configuration.nix` / hardware configuration は保持してください。
+
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    repro2.url = "github:bot-uichan/repro2/feat/tailscale-idp";
+  };
+
+  outputs = { nixpkgs, repro2, ... }: {
+    nixosConfigurations.my-builder = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        ./configuration.nix
+        repro2.nixosModules.default
+        {
+          services.repro2-sender = {
+            enable = true;
+            # 自分の trusted Serve endpoints に置換する placeholders。
+            registryUrl = "https://registry-host.example-tailnet.ts.net/";
+            blobUrl = "https://blob-host.example-tailnet.ts.net/";
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+自分の trusted Serve endpoints に置き換え、通常の `nixos-rebuild switch --flake .#my-builder` で適用します。その後は普通の Nix build だけで hook → 永続 queue → 常駐 publisher が動作します。別名 `repro2.nixosModules.repro2-sender` も同じ module です。`nix build github:bot-uichan/repro2/feat/tailscale-idp#repro2-sender` で sender 単体を取得できます。package は Linux (`x86_64-linux` / `aarch64-linux`) 用で、workspace の `Cargo.lock` とこの flake の pinned nixpkgs Rust compiler を使用します。`devShells` と既存 `cargo run -p builder` の動作は保持します。consumer の古い Rust toolchain に不用意に `repro2.inputs.nixpkgs.follows` を設定しないでください。Rust 2024 / std の file-lock API に加え、この lock の dependencies の MSRV が適用されます。この locked nixpkgs では Rust **1.97.1** で package build / tests を検証しています。
+
+- `enable` の default は **false**。disabled 時は hook / unit / directories を追加しません。`registryUrl` / `blobUrl` の default は **null** で、enabled 時は両方必須です。HTTP(S) + host、任意 port と単純な未エンコード path のみ。credentials / whitespace / query / fragment / percent encoding / dot components は evaluation で拒否します。URL は public Nix store / unit に保存されるので、secrets を入れないでください。認証情報や自己申告 identity を設定する option はありません。
+- `package` は sender package を置換する任意 option。`spoolDirectory` は `/var/lib/repro2-sender`、`gcRootsDirectory` は `/nix/var/nix/gcroots/repro2` が defaults です。変更先はそれぞれ `/var/lib/` / `/nix/var/nix/gcroots/` 配下の normalized path に限定します。tmpfiles が root-owned **0700** の永続 directories を用意し、daemon / sender の起動前に実行します。既存の symlink / writable ancestors 等は Rust queue の runtime validation でも拒否します。NFS / untrusted filesystem は非対応です。
+- hook と sender は **同じ root UID と標準 system store** 用です。hook は `/nix/store/...` の fail-safe wrapper と sender binary、unit は絶対 sender / `config.nix.package` binaries + `--store daemon` を使用します。alternative `NIX_STATE_DIR` / isolated or remote stores はこの module の対象外です。disabled daemon / non-root daemon は evaluation で拒否します。service は root で常駐し、private umask、read-only system filesystem + spool / roots のみ writable、restart-on-failure を設定します。
+- **既存 `nix.settings.post-build-hook` との併用は assertion / merge error で拒否**します。既存 hook を黙って上書きしたり暗黙に連結したりしません。既存 hook を整理するか、この module を disable し、明示的に設計した wrapper / service を運用してください。手書き `nix.extraOptions` の `post-build-hook` も事前に除去し、typed `nix.settings` で一元管理してください。
+- module は **sender のみ**。Tailscale の credentials / enrollment / ACL / Serve、server / gateway、consumer の `substituters` / `trusted-public-keys` / `require-sigs` は変更しません。builder device は user-owned tailnet device を別途用意し、Serve endpoints に接続可能にしてください。network が未準備なら queue / roots を保持して自動 retry します。443 の gateway URL は publication endpoints の代替ではありません。
+- `journalctl -u repro2-sender.service` と daemon / build logs の **CRITICAL local queue failure** を監視してください。network 障害は build を失敗させませんが、local recording failure では publication / GC retention を保証できません。disable / directory 変更前に pending jobs を送信完了してください。module の disable は既存 spool / GC roots を削除しないため、未送信 job を残した場合は旧設定を戻すか運用者が確認・修復します。
+
+module の evaluation tests（host に適用しません）:
+
+```sh
+nix eval --json .#checks.x86_64-linux.nixos-module.passthru.results
+nix build .#checks.x86_64-linux.nixos-module .#repro2-sender
+```
+
+### Manual setup once（非 NixOS 向け運用例、テストは host に適用しません）
 
 **Linux、信頼する local root、通常の `/nix/store` と `/nix/var/nix`、user-owned tailnet builder device** の例です。root の Nix daemon が呼ぶ hook と resident worker を同じ UID / store で動かします。registry / file-server の migration、loopback service、Serve / ACL と gateway の `REQUIRED_USERS` / `BLOB_BASE_URL` は上記の通り設定しておいてください。
 
