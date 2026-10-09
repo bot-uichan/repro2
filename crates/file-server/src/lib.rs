@@ -172,9 +172,25 @@ fn publish(
     destination: &FsPath,
     size: u64,
 ) -> Result<StatusCode, BlobError> {
+    publish_with_sync(temp, destination, size, || {
+        let parent = destination.parent().ok_or(BlobError::BadRequest)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })
+}
+
+fn publish_with_sync(
+    temp: tempfile::NamedTempFile,
+    destination: &FsPath,
+    size: u64,
+    sync: impl FnOnce() -> Result<(), BlobError>,
+) -> Result<StatusCode, BlobError> {
     // Same-directory no-clobber publication is atomic, including concurrent PUTs.
     match temp.persist_noclobber(destination) {
-        Ok(_) => Ok(StatusCode::CREATED),
+        Ok(_) => {
+            sync()?;
+            Ok(StatusCode::CREATED)
+        }
         Err(mut error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
             let mut existing = open_blob(destination)?;
             if existing.metadata()?.len() != size {
@@ -186,6 +202,8 @@ fn publish(
             loop {
                 let count = error.file.read(&mut left)?;
                 if count == 0 {
+                    // A previous request may have published but failed directory fsync.
+                    sync()?;
                     return Ok(StatusCode::OK);
                 }
                 existing.read_exact(&mut right[..count])?;
@@ -268,6 +286,38 @@ mod tests {
 
     fn key(bytes: &[u8]) -> String {
         format!("{:x}", Sha256::digest(bytes))
+    }
+
+    #[test]
+    fn publication_never_acknowledges_before_directory_sync_including_dedup_retry() {
+        use std::io::Write;
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("blob.nar");
+        let make = || {
+            let mut temp = tempfile::NamedTempFile::new_in(root.path()).unwrap();
+            temp.write_all(b"bytes").unwrap();
+            temp.as_file().sync_all().unwrap();
+            temp
+        };
+        let failure = || {
+            Err(BlobError::Io(std::io::Error::other(
+                "injected directory fsync failure",
+            )))
+        };
+        assert!(publish_with_sync(make(), &destination, 5, failure).is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"bytes");
+        assert!(publish_with_sync(make(), &destination, 5, failure).is_err());
+        let mut synced = false;
+        assert_eq!(
+            publish_with_sync(make(), &destination, 5, || {
+                std::fs::File::open(root.path())?.sync_all()?;
+                synced = true;
+                Ok(())
+            })
+            .unwrap(),
+            StatusCode::OK
+        );
+        assert!(synced);
     }
 
     #[tokio::test]

@@ -1,0 +1,12 @@
+#!/bin/sh
+# Root-owned, setup-once hook. No Nix subprocess and no network request.
+# Keep this wrapper even though `hook` logs local errors and returns success:
+# missing executable, loader errors and child signals must not fail a build.
+/usr/local/libexec/repro2-sender \
+    --spool /var/lib/repro2-sender \
+    --gc-roots /nix/var/nix/gcroots/repro2 hook
+status=$?
+if [ "$status" -ne 0 ]; then
+    printf '%s\n' "CRITICAL repro2 post-build hook could not record job (exit $status); publication and GC retention NOT guaranteed" >&2
+fi
+exit 0

@@ -1,4 +1,4 @@
-# repro2: Tailscale IdP による最小 report / threshold スライス
+# repro2: Tailscale IdP report / threshold と自動 NAR publisher
 
 このブランチは `feat/regsitry-consensus` を土台にした最小実装です。registry は報告の保存・提供だけを担当し、採用ポリシーは gateway が担当します。TEE、複数 gateway、consensus daemon、UI はありません。
 
@@ -69,7 +69,7 @@ cargo run -p builder -- 'nixpkgs#hello' \
 
 ## CA NAR blob file-server（phase 1）
 
-`file-server` はローカル filesystem 上の **content-addressed blob 配信だけ**を担当します。phase 2 では registry に IA store path → 複数 NAR candidate metadata を保存し、gateway が直接 blob URL の narinfo を生成します。hook、GC-protected queue、resident retry sender は **後続 phase・未実装**です。
+`file-server` はローカル filesystem 上の **content-addressed blob 配信だけ**を担当します。phase 2 では registry に IA store path → 複数 NAR candidate metadata を保存し、gateway が直接 blob URL の narinfo を生成します。phase 3 の hook / protected queue / resident sender は下記の別バイナリ `repro2-sender` で実装しています。
 
 ### HTTP protocol
 
@@ -103,7 +103,7 @@ Serve の運用例（実装・test は実行しません）:
 tailscale serve 3002
 ```
 
-Serve の仕様は既存の [official identity-header documentation](https://tailscale.com/docs/features/tailscale-serve#identity-headers) を参照してください。この phase は per-user authorization / quota、global storage quota、concurrency cap、request timeout、blob GC は実装しません。trusted uploader と deployment の disk quota / rate limit / timeout で resource exhaustion を抑制してください。upload 完了後の process kill / restart の persistence は検証していますが、power loss の durability・crash 時の temp-file scavenging は保証しません。crash 後の dot-prefixed temp files の削除は server を止めて運用者が行ってください。
+Serve の仕様は既存の [official identity-header documentation](https://tailscale.com/docs/features/tailscale-serve#identity-headers) を参照してください。この phase は per-user authorization / quota、global storage quota、concurrency cap、request timeout、blob GC は実装しません。trusted uploader と deployment の disk quota / rate limit / timeout で resource exhaustion を抑制してください。phase 3 では upload bytes の fsync に加え、publish 先 directory の fsync 完了後だけ 201 / 200 を返します。directory fsync failure は 500 となり、既に publish された同一 blob の再送でも fsync を再試行します。local filesystem / hardware が fsync を正しく実装する前提です。実 power-cut 耐久試験や crash 時の temp-file scavenging は未実施です。crash 後の dot-prefixed temp files の削除は server を止めて運用者が行ってください。
 
 `cargo test -p file-server` は real local HTTP listener と生成した valid uncompressed regular-file NAR bytes を使用します。process tests は実バイナリを起動し、config / private-root 作成 / upload limit / restart 後の GET・HEAD・dedup を検証します。実 Nix command や実 tailnet / Serve deployment の検証ではありません。
 
@@ -111,7 +111,7 @@ Serve の仕様は既存の [official identity-header documentation](https://tai
 
 `metadata` / `artifact` は nullable JSON text columns に保存します。migration は既存 row の identity / metadata を捏造せず保持し、metadata も unique result key に加えます。候補を失う downgrade は拒否するため、この migration の `down` は未対応です。必要なら migration 前の backup から復元してください。
 
-phase 1 の upload が完了したら、認証済みユーザーとして registry に report を POST します。既存 builder は新 metadata を送らないため、phase 2 の自動送信 hook / worker はまだありません。report 例（hash / size / paths は実際の NAR と出力の値に置換）:
+phase 1 の upload が完了したら、認証済みユーザーとして registry に report を POST します。phase 3 の worker はこの手順を自動化します。既存 `builder` の legacy report / cache URL 動作は変更していません。report 例（hash / size / paths は実際の NAR と出力の値に置換）:
 
 ```json
 {
@@ -139,6 +139,81 @@ gateway は file-server へ **HEAD** を送り、存在と `Content-Length == Fi
 
 生成する narinfo は `Compression: none` と明示的 `FileHash` / `FileSize` / `NarHash` / `NarSize` を持ち、references / deriver は Nix narinfo の basename 形式です。**IA path を CA path と宣言する `CA:` は追加しません。** `Sig:` も生成しません。この gateway の応答だけでは通常の Nix signature trust を満たさず、client 側 trust / signature 運用は別途必要です。TEE、新 proxy、NAR bytes の gateway 転送はありません。
 
+## 自動 post-build hook / protected queue / resident sender（phase 3）
+
+通常運用は **一度だけ hook と常駐 service を設定**し、その後は通常の Nix build を実行するだけです。各 build ごとの手動 enqueue / send / upload や追加の確認は不要です。`builder` の既存 installable / `--cache-url` 動作と `cargo run -p builder` の default binary は維持しています。
+
+### 自動経路と acceptance requirements
+
+1. Nix が build 後に渡す **`DRV_PATH` と `OUT_PATHS`** を `repro2-sender hook` が検証し、private spool の unique job directory に記録します。job JSON は mode 0600、directory は 0700。temporary file → fsync → atomic rename → directory fsync で公開します。全 outputs と `.drv` に **direct GC-root symlink** を作成して directory を fsync してから hook を戻します。hook は **Nix subprocess も network request も呼びません**。shell glob expansion も使いません。
+2. hook と worker の per-job nonblocking lock により、記録 / rooting 中の job を worker が削除する race を防ぎます。worker 自身の exclusive lock は enqueue と別なので、network 障害が hook を待たせません。rooting に失敗しても既に保存された manifest は消しません。worker が次の起動 / scan で再試行します。
+3. worker は起動時と約 1 秒ごとの scan で job を自動発見します。**同じ Nix store** の `nix derivation show` で output names を実 path と照合し、`nix path-info --json --recursive` と `nix store dump-path` から実 NAR / hash / size / references / deriver を取得します。dump bytes の SHA256 / size が path-info と一致しなければ公開せず retry します。全 reader command は `--option post-build-hook ''` を指定し、build / copy を呼びません。
+4. closure 全体の uncompressed NAR を `<blob endpoint>/nar/<lowercase SHA256 hex>.nar` へ PUT し、HEAD で同じ key / size を readback します。NAR は spool 内 file に dump し streaming hash / upload するため、NAR 全体を RAM に保持しません。その後 **この hook の built outputs のみ** registry へ authenticated metadata / artifact を POST し、`GET /nar-info/<store hash>` で実際の候補を readback します。先に upload するため、retry で既存 artifact を NULL に戻しません。
+5. worker は **identity を自己申告しません**。HTTPS の信頼する Tailscale Serve endpoints に接続し、Serve が付与する network identity を registry / file-server が使います。identity header / user / token を注入する本番 option はありません。redirect と environment HTTP proxy は無効です。backend loopback URL を指定するだけでは正常に認証できず 401 retry になります。
+6. network / Nix / HTTP / readback failure は **job と全 roots を保持**します。`retry.json` に attempts / Unix-seconds next_attempt / last_error を atomic 保存し、network delivery は exponential **2–256 秒**の backoff で自動 retry、restart 後も期限を継続します。同じ内容の再送は既存 immutable blob / registry upsert により新しい票を作りません。SIGTERM / SIGINT は正常終了を要求し、hung Nix reader を停止します（reader timeout 120 秒、HTTP timeout 30 秒）。SIGKILL / service restart でも committed job は残ります。
+7. 全 blob upload と output report の acknowledgement / readback 後に **durable `done.json`** を保存してから roots / queue を解放します。cleanup 中の restart は done marker から再開します。unexpected / mismatched root、symlink directory、untrusted writable ancestors、nonregular / symlink state file、traversal ID は拒否します。corrupt manifest は削除せず CRITICAL log を出し、他の valid jobs を処理します。
+
+[official Nix post-build-hook semantics](https://nix.dev/manual/nix/2.24/advanced-topics/post-build-hook) では hook が build loop を block し、nonzero exit が loop を終了することを説明しています。[official GC-root semantics](https://nix.dev/manual/nix/2.24/package-management/garbage-collector-roots) に従い、`gcroots` 内の subdirectories に direct symlinks を置きます。hook 内で `nix-store --realise` 等を呼び出して daemon / recursive hook を待つ方法は使いません。
+
+### Setup once（運用例、テストは host に適用しません）
+
+**Linux、信頼する local root、通常の `/nix/store` と `/nix/var/nix`、user-owned tailnet builder device** の例です。root の Nix daemon が呼ぶ hook と resident worker を同じ UID / store で動かします。registry / file-server の migration、loopback service、Serve / ACL と gateway の `REQUIRED_USERS` / `BLOB_BASE_URL` は上記の通り設定しておいてください。
+
+```sh
+cargo build --release -p builder --bin repro2-sender
+sudo install -D -m 0755 target/release/repro2-sender /usr/local/libexec/repro2-sender
+sudo install -d -m 0700 -o root -g root /var/lib/repro2-sender /nix/var/nix/gcroots/repro2
+sudo install -m 0755 examples/repro2-post-build-hook /etc/nix/repro2-post-build-hook
+# Replace both Serve URL placeholders and confirm the installed Nix executable path first.
+sudo install -m 0644 examples/repro2-sender.service /etc/systemd/system/repro2-sender.service
+```
+
+`/etc/nix/nix.conf` に追加（既存設定を保持）:
+
+```ini
+post-build-hook = /etc/nix/repro2-post-build-hook
+```
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now repro2-sender.service
+sudo systemctl restart nix-daemon.service
+# From now on: normal builds; no manual publication command.
+nix build --no-link '.#your-package'
+journalctl -u repro2-sender.service
+```
+
+`examples/repro2-post-build-hook` は binary の load / launch failure や signal による nonzero exit でも **CRITICAL warning を出して 0 を返す** fail-safe wrapper です。binary の `hook` 自身も local-record failure を明示して 0 を返します。**disk full / permissions / broken config / hook 自身の crash で記録できなかった build は、publication と GC retention を保証できません。** build success と local-record durability の両方を、故障した disk 上で保証することはできません。hook の stderr は Nix daemon / build logs、worker の errors は journal で監視し、local-record CRITICAL は必ず復旧 / 再 build してください。network failure は hook に到達せず build を失敗させません。
+
+### Configuration / debug CLI
+
+| Flag | Environment | Default / meaning |
+| --- | --- | --- |
+| `--spool` | `REPRO2_SPOOL` | `/var/lib/repro2-sender`, existing private directory |
+| `--gc-roots` | `REPRO2_GC_ROOTS` | `/nix/var/nix/gcroots/repro2`, existing private directory |
+| `run --registry-url` | `REPRO2_REGISTRY_URL` | required trusted Serve base URL |
+| `run --blob-url` | `REPRO2_BLOB_URL` | required trusted Serve base URL; same backend as gateway BLOB_BASE_URL |
+| `run --nix` | `REPRO2_NIX` | `nix`; service example uses an explicit executable |
+| `run --store` | `REPRO2_STORE` | `auto`; must be the store whose hook recorded the job |
+| `run --once` | — | debug scan, bypasses backoff; delivery errors return nonzero |
+
+```sh
+# Debug only. Normal operation is the resident service above.
+repro2-sender enqueue /nix/store/<drv-hash>-example.drv /nix/store/<hash>-example
+repro2-sender run --once --registry-url https://registry-host.example-tailnet.ts.net \
+  --blob-url https://file-server-host.example-tailnet.ts.net
+```
+
+### Operational limits / explicit trust
+
+- Each deployment handles **one configured Nix store**, not automatic discovery of arbitrary remote / per-build stores. A private directory elsewhere is **not automatically a GC root**: place the configured root directory under that store's actual `NIX_STATE_DIR/gcroots` (default `/nix/var/nix/gcroots`). For `local?root=/scratch/store`, use `/scratch/store/nix/var/nix/gcroots/repro2` and set the worker's same `--store`. The worker validates directory safety, not daemon configuration. The legacy builder's per-invocation isolated stores are not automatically routed into this system-store queue.
+- root / host operators / same UID processes, Nix metadata and stored paths, local filesystem with working fsync / atomic rename / locks, authenticated IdP / Serve / tailnet ACL, registry / file-server durability, and gateway operator are **trusted**. This is not a sandbox against malicious local root. NFS / network spool filesystems are unsupported. All queue / root ancestors must be real, owned by root or service UID, and not group/world writable; queue/root directories must be service-owned 0700. No TEE, new identity proxy, independent signing, or NAR gateway proxy is introduced.
+- **Copied / substituted dependency paths never cast reports.** Their bytes are uploaded for closure delivery, but each dependency still needs its own qualifying authenticated reports or an existing trusted substituter. A built output may have valid narinfo while full `nix copy` is blocked by a reference without per-path votes. The real-Nix integration test demonstrates both a successful reference-free import and that correctly blocked dependency closure. No artificial dependency votes or inferred independent builds are added.
+- Nix's hook runs for executed builds, not every substitution. Rooted derivations must expose concrete output paths in `derivation show`; floating CA / unresolved dynamic outputs are not claimed supported. Votes identify reporters, not a proof of independent execution. Existing builder settings allowing substitution remain unchanged.
+- Jobs / retained store closures / crash-left temporary NAR files can consume disk while offline. There is no queue quota, bandwidth limiter, concurrent sender pool, poison-job drop, automatic broken-record repair, or blob GC. Delivery is serial; temporary NAR disk usage may be one full uncompressed path plus crash leftovers. Fix persistent 401 / 413 / malformed metadata / configuration failures rather than discarding retention. Stop the worker before operator repair. Partial cleanup / pre-manifest crash directories may need operator removal after confirming delivery or absence of a committed job.
+- File-server first synchronizes file bytes and directory publication before acknowledgement; registry commit and immutable backend readback are trusted. Actual process restart tests pass, but **power-cut / storage-controller fault durability is not empirically verified**. Backups / remote storage persistence are operational responsibilities. Disk mutation / bit rot after acceptance remain outside this transport guarantee.
+- The gateway still returns **unsigned IA narinfo without CA declarations**. Trusting this gateway does not create a Nix signing key. Any client setting that permits unsigned import must be an explicit trusted-root deployment decision (the isolated smoke uses only command-scoped `require-sigs=false`), not a global security bypass silently installed by this project. Live Serve / systemd / daemon setup is an operator action, not performed by tests.
+
 ## 検証
 
 ```sh
@@ -149,10 +224,17 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo build --workspace
 python3 tests/http_slice.py
 python3 tests/blob_slice.py
+python3 tests/sender_slice.py
+# Opt-in: actual Nix executable; no installation/host daemon changes.
+REPRO2_REAL_NIX=/absolute/path/to/nix python3 tests/nix_sender_slice.py
 ```
 
 `tests/http_slice.py` は実際の migration / registry / gateway バイナリ、SQLite、一時的な local HTTP upstream を使います。3000 / 3001 が使用中なら実行しません。identity 必須、URL 検証、legacy 除外、再投稿 dedup、同一ユーザーの別結果、N=2、未公開ユーザーの一致票、不一致・同票、上流 NAR URL を確認します。ヘッダーは local trusted proxy を模して test が注入します。
 
 `tests/blob_slice.py` は実 migration / SQLite / registry / gateway / file-server を起動し、N=2、未公開票、同一 IA path の複数 NAR 候補、missing artifact / blob の 404、直接 GET / HEAD、download SHA256、references / deriver の basename serialization、gateway restart の安定性を検証します。
 
-**実 tailnet / Serve による IdP 検証、実 Nix ビルド・import・署名検証は未実施です。blob test は wire encoding で生成した regular-file NAR fixture を実 HTTP 配信しますが、実 Nix command の成果ではありません。legacy 上流 narinfo は明示的な mock であり、実 Nix の成功を装うものではありません。**
+`tests/sender_slice.py` は実 resident バイナリと上記 service 群を使い、local hook、503 と永続 backoff、SIGTERM / restart、後から到着した job の自動処理、blob / registry readback、GC root 解放、N=2 が再送で増えないことを検証します。Nix command は明示的 fake fixture、identity は **test-only local proxy** が注入します。通常 worker に identity 注入 option はありません。
+
+`tests/nix_sender_slice.py` は **実 Nix 2.24.11** を extracted closure + local launcher で動かし、scratch 内の diverted local store に multioutput derivation を実 build しました。Nix 自身による hook 呼出、実 GC 中の drv / 全 outputs 保持、実 path-info / dump-path / references / deriver、SIGKILL / restart 後の自動再送、gateway からの `nix copy` による reference-free output の import と内容 / hash、一時 root 解放後の実 GC を検証しています。host Bash builder が isolated store の physical prefix に書き込みます。host Nix installation / daemon / config / services は変更していません。
+
+**実 tailnet / Serve による IdP 検証、独立ユーザーの実再ビルド、署名 trust の検証は未実施です。** 実 Nix smoke は意図的に N=1 と test-only identity proxy を使い、unsigned gateway を信頼する consumer の `require-sigs=false` を command に限定して指定します。N=2 の policy は別 HTTP test で検証しています。blob / HTTP tests の wire-encoded NAR と legacy upstream mock は実 Nix の成果ではありません。

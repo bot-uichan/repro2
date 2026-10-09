@@ -1,0 +1,23 @@
+[Unit]
+Description=repro2 resident Nix NAR publisher
+Wants=network-online.target
+After=network-online.target tailscaled.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0077
+StateDirectory=repro2-sender
+StateDirectoryMode=0700
+# Replace both URL placeholders with trusted Tailscale Serve endpoints.
+# Must read the SAME Nix store whose daemon invokes the hook.
+ExecStart=/usr/local/libexec/repro2-sender run --registry-url https://registry-host.example-tailnet.ts.net --blob-url https://file-server-host.example-tailnet.ts.net --nix /nix/var/nix/profiles/default/bin/nix
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=40
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
