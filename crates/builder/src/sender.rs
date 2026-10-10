@@ -69,6 +69,100 @@ struct Report<'a> {
     artifact: Artifact,
 }
 
+// Nix 2.34's version 4 envelope uses store basenames, unlike the legacy map.
+fn derivation_output_names(
+    value: &serde_json::Value,
+    job: &Job,
+) -> Result<BTreeMap<String, String>> {
+    let root = value
+        .as_object()
+        .context("Nix derivation JSON must be an object")?;
+    let current = root.contains_key("derivations") || root.contains_key("version");
+    if current {
+        ensure!(
+            root.get("version").and_then(|v| v.as_u64()) == Some(4),
+            "unsupported Nix derivation JSON version"
+        );
+    }
+    let drv = if current {
+        // Queue jobs already validate the full top-level /nix/store derivation path.
+        let basename = job
+            .drv_path
+            .strip_prefix("/nix/store/")
+            .context("requested derivation must be a /nix/store path")?;
+        value.get("derivations").and_then(|v| v.get(basename))
+    } else {
+        value.get(&job.drv_path)
+    }
+    .context("requested Nix derivation missing")?;
+    if current {
+        ensure!(
+            drv.get("version").and_then(|v| v.as_u64()) == Some(4),
+            "unsupported Nix derivation entry version"
+        );
+    } else {
+        ensure!(
+            drv.get("version").is_none(),
+            "unexpected legacy derivation version"
+        );
+    }
+    let outputs = drv
+        .get("outputs")
+        .and_then(|v| v.as_object())
+        .context("Nix derivation output map missing")?;
+    let mut available = BTreeMap::new();
+    for (name, output) in outputs {
+        ensure!(!name.is_empty(), "empty Nix output name");
+        let output = output
+            .as_object()
+            .context("malformed Nix output specification")?;
+        if current {
+            // Version 4's input-addressed variant serializes an explicit path.
+            // Other variants (including fixed CA) are outside this parser's scope.
+            ensure!(
+                output.len() == 1 && output.contains_key("path"),
+                "unsupported or unresolved Nix output specification"
+            );
+        }
+        let path = output
+            .get("path")
+            .and_then(|v| v.as_str())
+            .context("unresolved or malformed Nix output path")?;
+        let full_path = if current {
+            ensure!(
+                !path.contains('/'),
+                "Nix output path must be a store basename"
+            );
+            format!("/nix/store/{path}")
+        } else {
+            path.to_owned()
+        };
+        let basename = full_path
+            .strip_prefix("/nix/store/")
+            .context("Nix output must be a /nix/store path")?;
+        ensure!(
+            !basename.contains('/'),
+            "Nix output must be a top-level store path"
+        );
+        let _: nix_derivation::StorePath = full_path
+            .parse()
+            .context("malformed Nix output store path")?;
+        ensure!(
+            available.insert(full_path, name.clone()).is_none(),
+            "ambiguous Nix output path"
+        );
+    }
+    job.outputs
+        .iter()
+        .map(|path| {
+            let name = available
+                .get(path)
+                .context("queued output absent from derivation")?;
+            Ok((path.clone(), name.clone()))
+        })
+        .collect()
+}
+
 fn now() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
 }
@@ -229,20 +323,7 @@ impl Sender {
         let blob = base_url(&self.blob_url)?;
         let derivation: serde_json::Value =
             serde_json::from_reader(self.nix_output(dir, &["derivation", "show", &job.drv_path])?)?;
-        let outputs = derivation
-            .get(&job.drv_path)
-            .and_then(|v| v.get("outputs"))
-            .and_then(|v| v.as_object())
-            .context("Nix derivation output map missing")?;
-        let mut names = BTreeMap::new();
-        for path in &job.outputs {
-            let name = outputs
-                .iter()
-                .find(|(_, v)| v.get("path").and_then(|v| v.as_str()) == Some(path))
-                .map(|(name, _)| name.clone())
-                .context("queued output absent from derivation")?;
-            names.insert(path.clone(), name);
-        }
+        let names = derivation_output_names(&derivation, job)?;
         let args: Vec<&str> = ["path-info", "--json", "--recursive"]
             .into_iter()
             .chain(job.outputs.iter().map(String::as_str))
@@ -381,5 +462,195 @@ impl Sender {
         }
         sync_dir(dir)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const DRV: &str = "/nix/store/y1a49lg2ja68djssigz14lhdxvxcwbxa-example.drv";
+    const OUT: &str = "/nix/store/y1a49lg2ja68djssigz14lhdxvxcwbxa-example";
+
+    fn job() -> Job {
+        Job::new(DRV.into(), vec![OUT.into()]).unwrap()
+    }
+
+    fn current() -> serde_json::Value {
+        json!({"version": 4, "derivations": {
+            &DRV[11..]: {"version": 4, "outputs": {"out": {"path": &OUT[11..]}}}
+        }})
+    }
+
+    #[test]
+    fn rejects_unknown_or_malformed_derivation_versions() {
+        for version in [
+            json!(0),
+            json!(1),
+            json!(2),
+            json!(3),
+            json!(5),
+            json!(null),
+            json!("4"),
+            json!(4.0),
+            json!(true),
+        ] {
+            let mut value = current();
+            value["version"] = version.clone();
+            assert!(
+                derivation_output_names(&value, &job()).is_err(),
+                "root {version}"
+            );
+            let mut value = current();
+            value["derivations"][&DRV[11..]]["version"] = version.clone();
+            assert!(
+                derivation_output_names(&value, &job()).is_err(),
+                "drv {version}"
+            );
+        }
+        let mut value = current();
+        value.as_object_mut().unwrap().remove("version");
+        assert!(derivation_output_names(&value, &job()).is_err());
+        let mut value = current();
+        value["derivations"][&DRV[11..]]
+            .as_object_mut()
+            .unwrap()
+            .remove("version");
+        assert!(derivation_output_names(&value, &job()).is_err());
+        // Never fall back to a plausible legacy entry when a version is present.
+        let value = json!({"version": 99, DRV: {"outputs": {"out": {"path": OUT}}}});
+        assert!(derivation_output_names(&value, &job()).is_err());
+        let value = json!({DRV: {"version": 99, "outputs": {"out": {"path": OUT}}}});
+        assert!(derivation_output_names(&value, &job()).is_err());
+    }
+
+    #[test]
+    fn rejects_unresolved_malformed_or_ambiguous_outputs() {
+        for output in [
+            json!(null),
+            json!(7),
+            json!({}),
+            json!({"path": null}),
+            json!({"path": ""}),
+            json!({"path": "../example"}),
+            json!({"path": "y1a49lg2ja68djssigz14lhdxvxcwbxa-example/subpath"}),
+            json!({"path": "e1a49lg2ja68djssigz14lhdxvxcwbxa-example"}),
+            json!({"path": OUT}),
+            json!({"path": "y1a49lg2ja68djssigz14lhdxvxcwbxa-example-dev", "unexpected": true}),
+            json!({"method": "nar", "hashAlgo": "sha256"}),
+        ] {
+            let mut value = current();
+            // Even an unqueued output may not hide malformed/unresolved identities.
+            value["derivations"][&DRV[11..]]["outputs"]["dev"] = output.clone();
+            assert!(derivation_output_names(&value, &job()).is_err(), "{output}");
+        }
+        let mut value = current();
+        value["derivations"][&DRV[11..]]["outputs"]["dev"] = json!({"path": &OUT[11..]});
+        assert!(
+            derivation_output_names(&value, &job()).is_err(),
+            "ambiguous path"
+        );
+        let mut value = current();
+        let output = value["derivations"][&DRV[11..]]["outputs"]["out"].take();
+        value["derivations"][&DRV[11..]]["outputs"] = json!({"": output});
+        assert!(
+            derivation_output_names(&value, &job()).is_err(),
+            "empty output name"
+        );
+        let value =
+            json!({DRV: {"outputs": {"out": {"path": OUT}, "dev": {"path": "../example"}}}});
+        assert!(
+            derivation_output_names(&value, &job()).is_err(),
+            "legacy traversal"
+        );
+    }
+
+    #[test]
+    fn maps_real_nix_234_multioutput_fixture_exactly() {
+        let value: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/nix-2.34.8-derivation.json"))
+                .unwrap();
+        let drv = "/nix/store/51yi00crbyf51kxdp6gsxxzmd4f83dzc-repro2-json-probe.drv";
+        let out = "/nix/store/limr2sn9jwp351gh26cgfb4c9664yv6y-repro2-json-probe";
+        let dev = "/nix/store/vs00n6z39xsmq54kndj5spz74vp839zn-repro2-json-probe-dev";
+        let job = Job::new(drv.into(), vec![out.into(), dev.into()]).unwrap();
+        assert_eq!(
+            derivation_output_names(&value, &job).unwrap(),
+            BTreeMap::from([(out.into(), "out".into()), (dev.into(), "dev".into())])
+        );
+        let job = Job::new(drv.into(), vec![dev.into()]).unwrap();
+        assert_eq!(
+            derivation_output_names(&value, &job).unwrap(),
+            BTreeMap::from([(dev.into(), "dev".into())])
+        );
+    }
+
+    #[test]
+    fn maps_legacy_multioutput_with_content_address_metadata() {
+        let dev = "/nix/store/y1a49lg2ja68djssigz14lhdxvxcwbxa-example-dev";
+        let value = json!({DRV: {"name": "example", "env": {}, "inputDrvs": {},
+            "outputs": {"out": {"path": OUT, "method": "nar", "hashAlgo": "sha256", "hash": "6fc80dcc62179dbc12fc0b5881275898f93444833d21b89dfe5f7fbcbb1d0d62"},
+                "dev": {"path": dev}}, "structuredAttrs": {"arbitrary": true}}});
+        let job = Job::new(DRV.into(), vec![OUT.into(), dev.into()]).unwrap();
+        assert_eq!(
+            derivation_output_names(&value, &job).unwrap(),
+            BTreeMap::from([(OUT.into(), "out".into()), (dev.into(), "dev".into())])
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_drv_without_inferring_first_or_env_output() {
+        let other = "y1a49lg2ja68djssigz14lhdxvxcwbxa-other.drv";
+        let mut value = current();
+        let drv = value["derivations"]
+            .as_object_mut()
+            .unwrap()
+            .remove(&DRV[11..])
+            .unwrap();
+        value["derivations"][other] = drv;
+        assert!(derivation_output_names(&value, &job()).is_err());
+        let value = json!({format!("/nix/store/{other}"): {"outputs": {"out": {"path": OUT}}}});
+        assert!(derivation_output_names(&value, &job()).is_err());
+        let mut value = current();
+        value["derivations"][&DRV[11..]]["outputs"]["out"]["path"] =
+            "y1a49lg2ja68djssigz14lhdxvxcwbxa-other".into();
+        value["derivations"][&DRV[11..]]["env"] = json!({"out": OUT});
+        assert!(derivation_output_names(&value, &job()).is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_envelopes_and_output_maps() {
+        for value in [
+            json!(null),
+            json!([]),
+            json!({}),
+            json!({"version": 4}),
+            json!({"version": 4, "derivations": []}),
+            json!({"version": 4, "derivations": {DRV: {"version": 4, "outputs": {"out": {"path": OUT}}}}}),
+            json!({DRV: null}),
+            json!({DRV: {"outputs": []}}),
+            json!({DRV: {"outputs": {"out": {"path": &OUT[11..]}}}}),
+        ] {
+            assert!(derivation_output_names(&value, &job()).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn selects_requested_drv_even_when_another_drv_is_first() {
+        let other = "00000000000000000000000000000000-other.drv";
+        let mut value = current();
+        value["derivations"][other] = json!({"version": 4,
+            "outputs": {"wrong": {"path": &OUT[11..]}}});
+        assert_eq!(
+            derivation_output_names(&value, &job()).unwrap(),
+            BTreeMap::from([(OUT.into(), "out".into())])
+        );
+        let value = json!({format!("/nix/store/{other}"): {"outputs": {"wrong": {"path": OUT}}},
+            DRV: {"outputs": {"out": {"path": OUT}}}});
+        assert_eq!(
+            derivation_output_names(&value, &job()).unwrap(),
+            BTreeMap::from([(OUT.into(), "out".into())])
+        );
     }
 }

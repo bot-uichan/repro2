@@ -7,8 +7,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DRV: &str = "/nix/store/y1a49lg2ja68djssigz14lhdxvxcwbxa-example.drv";
-const OUT: &str = "/nix/store/y1a49lg2ja68djssigz14lhdxvxcwbxa-example";
+const DRV: &str = "/nix/store/51yi00crbyf51kxdp6gsxxzmd4f83dzc-repro2-json-probe.drv";
+const OUT: &str = "/nix/store/limr2sn9jwp351gh26cgfb4c9664yv6y-repro2-json-probe";
 
 fn setup(tmp: &Path) -> (std::path::PathBuf, std::path::PathBuf, String) {
     let spool = tmp.join("spool");
@@ -51,12 +51,45 @@ fn run(spool: &Path, roots: &Path, nix: &Path) -> Command {
 
 #[test]
 fn inconsistent_nix_dump_retains_job_and_roots_without_publication() {
+    inconsistent_nix_dump_retains_job(false, false);
+}
+
+#[test]
+fn current_derivation_json_reaches_dump_validation_and_retains_job() {
+    inconsistent_nix_dump_retains_job(true, false);
+}
+
+#[test]
+fn legacy_derivation_with_array_path_info_reaches_dump_validation() {
+    inconsistent_nix_dump_retains_job(false, true);
+}
+
+#[test]
+fn current_derivation_with_array_path_info_reaches_dump_validation() {
+    inconsistent_nix_dump_retains_job(true, true);
+}
+
+fn inconsistent_nix_dump_retains_job(current: bool, array_path_info: bool) {
     let tmp = tempfile::tempdir().unwrap();
     let (spool, roots, id) = setup(tmp.path());
+    let derivation = if current {
+        serde_json::from_str(include_str!("fixtures/nix-2.34.8-derivation.json")).unwrap()
+    } else {
+        serde_json::json!({DRV: {"outputs": {"out": {"path": OUT}}}})
+    };
+    let info = serde_json::json!({"narHash": "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        "narSize": 7, "references": [], "deriver": DRV});
+    let path_info = if array_path_info {
+        let mut info = info;
+        info["path"] = OUT.into();
+        serde_json::json!([info])
+    } else {
+        serde_json::json!({OUT: info})
+    };
     let script = format!(
         r#"case "$*" in
-*"derivation show"*) printf '%s' '{{"{DRV}":{{"outputs":{{"out":{{"path":"{OUT}"}}}}}}}}' ;;
-*"path-info"*) printf '%s' '{{"{OUT}":{{"narHash":"sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","narSize":7,"references":[],"deriver":"{DRV}"}}}}' ;;
+*"derivation show"*) printf '%s' '{derivation}' ;;
+*"path-info"*) printf '%s' '{path_info}' ;;
 *"dump-path"*) printf invalid ;;
 esac"#
     );
@@ -73,7 +106,17 @@ esac"#
         "{retry}"
     );
     assert!(spool.join(&id).join("job.json").exists());
+    assert!(!spool.join(&id).join("done.json").exists());
+    assert_eq!(retry["attempts"], 1);
     assert_eq!(fs::read_dir(roots.join(&id)).unwrap().count(), 2);
+    assert_eq!(
+        fs::read_link(roots.join(&id).join("0")).unwrap(),
+        Path::new(DRV)
+    );
+    assert_eq!(
+        fs::read_link(roots.join(&id).join("1")).unwrap(),
+        Path::new(OUT)
+    );
 }
 
 struct Process(Child);

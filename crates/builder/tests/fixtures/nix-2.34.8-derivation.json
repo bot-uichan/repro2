@@ -1,0 +1,36 @@
+{
+  "derivations": {
+    "51yi00crbyf51kxdp6gsxxzmd4f83dzc-repro2-json-probe.drv": {
+      "args": [
+        "-c",
+        "printf out-bytes > $testRoot$out; printf dev-bytes > $testRoot$dev"
+      ],
+      "builder": "/usr/bin/bash",
+      "env": {
+        "builder": "/usr/bin/bash",
+        "dev": "/nix/store/vs00n6z39xsmq54kndj5spz74vp839zn-repro2-json-probe-dev",
+        "name": "repro2-json-probe",
+        "out": "/nix/store/limr2sn9jwp351gh26cgfb4c9664yv6y-repro2-json-probe",
+        "outputs": "out dev",
+        "system": "x86_64-linux",
+        "testRoot": "/root/.hermes/cache/scratch/repro2-nix234/probe-store"
+      },
+      "inputs": {
+        "drvs": {},
+        "srcs": []
+      },
+      "name": "repro2-json-probe",
+      "outputs": {
+        "dev": {
+          "path": "vs00n6z39xsmq54kndj5spz74vp839zn-repro2-json-probe-dev"
+        },
+        "out": {
+          "path": "limr2sn9jwp351gh26cgfb4c9664yv6y-repro2-json-probe"
+        }
+      },
+      "system": "x86_64-linux",
+      "version": 4
+    }
+  },
+  "version": 4
+}
