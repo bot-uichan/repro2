@@ -45,6 +45,9 @@
       // nixpkgs.lib.optionalAttrs (nixpkgs.lib.hasSuffix "-linux" system) {
         packages.repro2-sender = pkgs.callPackage ./nix/package.nix { };
         packages.default = self.packages.${system}.repro2-sender;
+        checks.nixos-lifecycle = import ./tests/nixos-lifecycle.nix {
+          inherit self nixpkgs system;
+        };
         checks.nixos-module = import ./tests/nixos-module.nix {
           inherit self nixpkgs system;
         };

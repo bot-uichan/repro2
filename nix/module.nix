@@ -8,9 +8,16 @@ let
     && builtins.match "https?://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?" value != null
     && !(builtins.any (part: part == "." || part == "..") (lib.splitString "/" value));
   sender = "${cfg.package}/bin/repro2-sender";
+  lifecycle = pkgs.writeText "repro2-lifecycle.py" ''
+    ROOTS = ${builtins.toJSON cfg.gcRootsDirectory}
+    SYSTEMCTL = ${builtins.toJSON "${pkgs.systemd}/bin/systemctl"}
+    SENDER = ${builtins.toJSON sender}
+    ${builtins.readFile ./lifecycle.py}
+  '';
+  guardianName = "repro2-gc-guardian-${builtins.substring 0 16 (builtins.hashString "sha256" cfg.gcRootsDirectory)}";
   hook = pkgs.writeShellScript "repro2-post-build-hook" ''
     # Do not let launch/loader/signal failures fail an otherwise successful build.
-    ${lib.escapeShellArgs [ sender "--spool" cfg.spoolDirectory "--gc-roots" cfg.gcRootsDirectory "hook" ]}
+    ${lib.escapeShellArgs [ "${pkgs.python3}/bin/python3" (toString lifecycle) "gate" "--spool" cfg.spoolDirectory "--gc-roots" cfg.gcRootsDirectory "hook" ]}
     status=$?
     if [ "$status" -ne 0 ]; then
       printf '%s\n' "CRITICAL repro2 post-build hook could not record job (exit $status); publication and GC retention NOT guaranteed" >&2
@@ -61,8 +68,10 @@ in
         message = "services.repro2-sender registryUrl and blobUrl must be HTTP(S) base URLs without credentials, whitespace, query, fragment, encoding or dot path components."; }
       { assertion = safePath cfg.spoolDirectory && lib.hasPrefix "/var/lib/" cfg.spoolDirectory;
         message = "services.repro2-sender spoolDirectory must be a normalized private path below /var/lib."; }
-      { assertion = safePath cfg.gcRootsDirectory && lib.hasPrefix "/nix/var/nix/gcroots/" cfg.gcRootsDirectory;
-        message = "services.repro2-sender gcRootsDirectory must be a normalized path below /nix/var/nix/gcroots."; }
+      { assertion = safePath cfg.gcRootsDirectory && lib.hasPrefix "/nix/var/nix/gcroots/" cfg.gcRootsDirectory
+          && !(builtins.any (reserved: cfg.gcRootsDirectory == "/nix/var/nix/gcroots/${reserved}"
+            || lib.hasPrefix "/nix/var/nix/gcroots/${reserved}/" cfg.gcRootsDirectory) [ "auto" "per-user" "profiles" ]);
+        message = "services.repro2-sender gcRootsDirectory must be a normalized dedicated path below /nix/var/nix/gcroots, outside the reserved auto, per-user and profiles subtrees."; }
       { assertion = !(builtins.any (line:
           builtins.match "[[:space:]]*post-build-hook[[:space:]]*=.*" line != null
         ) (lib.splitString "\n" config.nix.extraOptions));
@@ -75,9 +84,29 @@ in
     # rejects it instead of silently dropping either hook.
     nix.settings.post-build-hook = lib.mkDefault (toString hook);
     systemd.tmpfiles.rules = [
+      "d /run/repro2-sender-lifecycle 0700 root root - -"
       "d ${cfg.spoolDirectory} 0700 root root - -"
       "d ${cfg.gcRootsDirectory} 0700 root root - -"
     ];
+    # The old generation remains responsible after module/import removal.
+    # NixOS honours X-StopOnRemoval before activation; no ExecStop deletes roots.
+    system.build.repro2-lifecycle = lifecycle;
+    environment.etc.repro2-sender-lifecycle.text = "enabled\n";
+    systemd.services.${guardianName} = {
+      description = "repro2 enabled-generation GC-root guardian";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "systemd-tmpfiles-setup.service" ];
+      restartIfChanged = false;
+      unitConfig."X-StopOnRemoval" = false;
+      serviceConfig = {
+        Type = "simple";
+        User = "root";
+        UMask = "0077";
+        ExecStart = "${pkgs.python3}/bin/python3 ${lifecycle}";
+        Restart = "on-failure";
+        RestartSec = "5s";
+      };
+    };
     systemd.services.nix-daemon.after = [ "systemd-tmpfiles-setup.service" ];
     systemd.services.nix-daemon.requires = [ "systemd-tmpfiles-setup.service" ];
     systemd.services.repro2-sender = {

@@ -68,6 +68,12 @@ let
   sender = enabled.systemd.services.repro2-sender;
   package = self.packages.${system}.repro2-sender;
   results = {
+    enabledGenerationOwnsPersistentTeardown = enabled.system.build ? repro2-lifecycle
+      && builtins.any (unit: (unit.unitConfig."X-StopOnRemoval" or true) == false
+        && !(unit.serviceConfig ? ExecStop)
+        && !(unit.serviceConfig ? ExecStopPost)
+        && !unit.restartIfChanged)
+        (builtins.attrValues enabled.systemd.services);
     disabledIsInert = !(disabled.systemd.services ? repro2-sender)
       && !(disabled.nix.settings ? post-build-hook)
       && !(builtins.any (r: lib.hasInfix "repro2" r) disabled.systemd.tmpfiles.rules);
@@ -104,6 +110,7 @@ let
     relativeSpoolRejected = invalid { spoolDirectory = "relative"; };
     traversalRejected = invalid { spoolDirectory = "/var/lib/../unsafe"; };
     unsafeSpoolRejected = invalid { spoolDirectory = "/tmp/repro2-sender"; };
+    reservedGcRootRejected = invalid { gcRootsDirectory = "/nix/var/nix/gcroots/auto/repro2"; };
     nonGcRootRejected = invalid { gcRootsDirectory = "/var/lib/repro2-roots"; };
   };
   failures = lib.attrNames (lib.filterAttrs (_: passed: !passed) results);
