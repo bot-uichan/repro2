@@ -202,6 +202,8 @@ nix eval --json .#checks.x86_64-linux.nixos-module.passthru.results
 nix build .#checks.x86_64-linux.nixos-module .#repro2-sender
 ```
 
+Nix package の Cargo tests は `fakeroot` を test runner として実行します。Nix sandbox の `/` が unmapped UID 所有でも、root service 用の fixture を検証できるようにするためです。実際の root 権限は付与せず、permission / symlink の拒否テストも実行します。installed sender の所有者・権限検証は変更せず、runtime に `fakeroot` は使用しません。
+
 ### Manual setup once（非 NixOS 向け運用例、テストは host に適用しません）
 
 **Linux、信頼する local root、通常の `/nix/store` と `/nix/var/nix`、user-owned tailnet builder device** の例です。root の Nix daemon が呼ぶ hook と resident worker を同じ UID / store で動かします。registry / file-server の migration、loopback service、Serve / ACL と gateway の `REQUIRED_USERS` / `BLOB_BASE_URL` は上記の通り設定しておいてください。

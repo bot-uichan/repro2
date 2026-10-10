@@ -1,4 +1,4 @@
-{ lib, rustPlatform, bash }:
+{ lib, rustPlatform, bash, fakeroot }:
 rustPlatform.buildRustPackage {
   pname = "repro2-sender";
   version = "0.1.0";
@@ -15,7 +15,13 @@ rustPlatform.buildRustPackage {
   };
   cargoLock.lockFile = ../Cargo.lock;
   cargoBuildFlags = [ "-p" "builder" "--bin" "repro2-sender" ];
-  cargoTestFlags = [ "-p" "builder" "-p" "nar-metadata" ];
+  cargoTestFlags = [
+    "-p" "builder" "-p" "nar-metadata"
+    # Nix sandbox / can be owned by an unmapped UID, unlike the deployed host.
+    # Model the root service's ownership only while running test executables.
+    # Permission/symlink checks remain active; the installed binary is unchanged.
+    "--config" "target.'cfg(unix)'.runner='${fakeroot}/bin/fakeroot'"
+  ];
   postPatch = ''
     # Existing process-test fixtures must use a store shell in the sandbox.
     substituteInPlace crates/builder/tests/hook.rs crates/builder/tests/sender.rs \
