@@ -1,4 +1,4 @@
-{ lib, rustPlatform, bash, fakeroot }:
+{ lib, rustPlatform, bash, fakeroot, cacert }:
 rustPlatform.buildRustPackage {
   pname = "repro2-sender";
   version = "0.1.0";
@@ -33,6 +33,9 @@ rustPlatform.buildRustPackage {
     mkdir -m 0700 "$CARGO_HOME"
   '';
   preCheck = ''
+    # Client construction loads CA roots even for local HTTP-only test endpoints.
+    # Never rely on the host's /etc/ssl/certs leaking into the build environment.
+    export SSL_CERT_FILE="${cacert}/etc/ssl/certs/ca-bundle.crt"
     # Queue tests intentionally reject writable ancestors (including /build).
     chmod go-w "$NIX_BUILD_TOP"
     export TMPDIR="$NIX_BUILD_TOP/repro2-tests"

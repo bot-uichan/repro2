@@ -202,7 +202,7 @@ nix eval --json .#checks.x86_64-linux.nixos-module.passthru.results
 nix build .#checks.x86_64-linux.nixos-module .#repro2-sender
 ```
 
-Nix package の Cargo tests は `fakeroot` を test runner として実行します。Nix sandbox の `/` が unmapped UID 所有でも、root service 用の fixture を検証できるようにするためです。実際の root 権限は付与せず、permission / symlink の拒否テストも実行します。installed sender の所有者・権限検証は変更せず、runtime に `fakeroot` は使用しません。
+Nix package の Cargo tests は `fakeroot` を test runner として実行します。Nix sandbox の `/` が unmapped UID 所有でも、root service 用の fixture を検証できるようにするためです。実際の root 権限は付与せず、permission / symlink の拒否テストも実行します。installed sender の所有者・権限検証は変更せず、runtime に `fakeroot` は使用しません。HTTP client の初期化は local HTTP fixture でも CA roots を読み込むため、`preCheck` で Nixpkgs `cacert` の store 内 bundle を `SSL_CERT_FILE` に明示します。host の `/etc/ssl/certs` はテストの前提にしません。NixOS service も独立して store 内 CA bundle を設定します。
 
 ### Manual setup once（非 NixOS 向け運用例、テストは host に適用しません）
 
