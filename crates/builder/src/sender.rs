@@ -32,6 +32,15 @@ pub struct Sender {
     pub nix: PathBuf,
     #[arg(long, env = "REPRO2_STORE", default_value = "auto")]
     pub store: String,
+    /// TCP connection deadline (seconds); applies to metadata and blob requests.
+    #[arg(long, env = "REPRO2_CONNECT_TIMEOUT_SECS", default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=300))]
+    pub connect_timeout_secs: u64,
+    /// Total deadline for HEAD/registry requests and Nix metadata readers.
+    #[arg(long, env = "REPRO2_METADATA_TIMEOUT_SECS", default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    pub metadata_timeout_secs: u64,
+    /// Total deadline for each blob PUT and each Nix NAR dump (seconds).
+    #[arg(long, env = "REPRO2_TRANSFER_TIMEOUT_SECS", default_value_t = 3600, value_parser = clap::value_parser!(u64).range(1..=86400))]
+    pub transfer_timeout_secs: u64,
     /// Debug mode: one scan, nonzero if any delivery fails. Normal operation is resident.
     #[arg(long)]
     pub once: bool,
@@ -43,6 +52,60 @@ struct Retry {
     attempts: u32,
     next_attempt: u64,
     last_error: String,
+}
+
+// Resident, bounded failure circuit shared by all jobs. Never evict a live
+// cooldown to make room: capacity pressure defers new work instead of thrashing.
+const MAX_BLOB_FAILURES: usize = 1024;
+#[derive(Default)]
+struct BlobFailures(BTreeMap<String, (u32, u64)>);
+#[derive(Debug)]
+struct RetryAfter {
+    next_attempt: u64,
+    message: String,
+}
+impl std::fmt::Display for RetryAfter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (retry after {})", self.message, self.next_attempt)
+    }
+}
+impl std::error::Error for RetryAfter {}
+impl BlobFailures {
+    fn check(&mut self, key: &str, now: u64) -> Result<()> {
+        if let Some((_, until)) = self.0.get(key) {
+            if *until > now {
+                return Err(RetryAfter {
+                    next_attempt: *until,
+                    message: "shared blob cooldown".into(),
+                }
+                .into());
+            }
+        } else if self.0.len() >= MAX_BLOB_FAILURES {
+            let oldest = self.0.iter().min_by_key(|(_, (_, until))| *until).unwrap();
+            if oldest.1.1 > now {
+                return Err(RetryAfter {
+                    next_attempt: oldest.1.1,
+                    message: "blob failure circuit capacity reached".into(),
+                }
+                .into());
+            }
+            let key = oldest.0.clone();
+            self.0.remove(&key);
+        }
+        Ok(())
+    }
+    fn failed(&mut self, key: String, now: u64, error: anyhow::Error) -> anyhow::Error {
+        let attempts = self.0.get(&key).map_or(1, |(n, _)| n.saturating_add(1));
+        let until = now.saturating_add(
+            (60u64.saturating_mul(1u64 << attempts.min(4).saturating_sub(1))).min(300),
+        );
+        self.0.insert(key, (attempts, until));
+        RetryAfter {
+            next_attempt: until,
+            message: format!("{error:#}"),
+        }
+        .into()
+    }
 }
 
 #[derive(Deserialize)]
@@ -206,9 +269,10 @@ impl Sender {
         let http = Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(30))
-            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(self.metadata_timeout_secs))
+            .connect_timeout(Duration::from_secs(self.connect_timeout_secs))
             .build()?;
+        let mut blob_failures = BlobFailures::default();
         loop {
             let mut failed = false;
             for (id, job) in queue.jobs()? {
@@ -233,15 +297,20 @@ impl Sender {
                         return Ok(());
                     }
                     queue.retain(&id, &job)?;
-                    match self.deliver(&http, &dir, &job) {
+                    match self.deliver(&http, &dir, &job, &mut blob_failures) {
                         Ok(()) => {
                             atomic_json(&dir.join("done.json"), &true)?;
                             queue.cleanup(&id, &job)
                         }
                         Err(error) => {
                             let attempts = retry.attempts.saturating_add(1);
-                            let next_attempt =
-                                now()?.saturating_add((1u64 << attempts.min(8)).min(300));
+                            let next_attempt = now()?
+                                .saturating_add((1u64 << attempts.min(8)).min(300))
+                                .max(
+                                    error
+                                        .downcast_ref::<RetryAfter>()
+                                        .map_or(0, |e| e.next_attempt),
+                                );
                             atomic_json(
                                 &dir.join("retry.json"),
                                 &Retry {
@@ -263,7 +332,10 @@ impl Sender {
                 ensure!(!failed, "delivery failed; jobs and roots retained");
                 return Ok(());
             }
-            for _ in 0..10 {
+            // Bound idle queue scans (including corrupt entries), while checking
+            // shutdown every 100ms. Idle scans are at most 10 seconds apart; active
+            // serial deliveries can delay the discovery of newly enqueued jobs.
+            for _ in 0..100 {
                 if STOP.load(Ordering::Relaxed) {
                     return Ok(());
                 }
@@ -298,7 +370,12 @@ impl Sender {
             .stderr(errors.as_file().try_clone()?)
             .spawn()
             .context("start Nix reader")?;
-        let deadline = Instant::now() + Duration::from_secs(120);
+        let seconds = if args.starts_with(&["store", "dump-path"]) {
+            self.transfer_timeout_secs
+        } else {
+            self.metadata_timeout_secs
+        };
+        let deadline = Instant::now() + Duration::from_secs(seconds);
         let status = loop {
             if let Some(status) = child.try_wait()? {
                 break status;
@@ -318,12 +395,107 @@ impl Sender {
         Ok(output)
     }
 
-    fn deliver(&self, http: &Client, dir: &Path, job: &Job) -> Result<()> {
+    // Ask the selected Nix to compute fixed-CA paths from the actual .drv,
+    // selecting each concrete output by its validated name. Nix's .drv import
+    // reads drv.outputs, not env output variables; never infer from map order.
+    fn output_names(
+        &self,
+        dir: &Path,
+        value: &serde_json::Value,
+        job: &Job,
+    ) -> Result<BTreeMap<String, String>> {
+        if value.get("version").and_then(|v| v.as_u64()) != Some(4) {
+            return derivation_output_names(value, job);
+        }
+        let basename = job
+            .drv_path
+            .strip_prefix("/nix/store/")
+            .context("invalid drv path")?;
+        let entry = value
+            .get("derivations")
+            .and_then(|v| v.get(basename))
+            .context("requested Nix derivation missing")?;
+        ensure!(
+            entry.get("version").and_then(|v| v.as_u64()) == Some(4),
+            "unsupported Nix derivation entry version"
+        );
+        let outputs = entry
+            .get("outputs")
+            .and_then(|v| v.as_object())
+            .context("missing output map")?;
+        let mut fixed = Vec::new();
+        for (name, spec) in outputs {
+            let spec = spec.as_object().context("malformed output specification")?;
+            if spec.len() == 1 && spec.contains_key("path") {
+                continue;
+            }
+            ensure!(
+                spec.len() == 2
+                    && matches!(
+                        spec.get("method").and_then(|v| v.as_str()),
+                        Some("flat" | "nar")
+                    )
+                    && spec.contains_key("hash"),
+                "unsupported or unresolved Nix output specification"
+            );
+            let _: NixHash = spec["hash"]
+                .as_str()
+                .context("invalid fixed-CA hash")?
+                .parse()?;
+            ensure!(
+                !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')),
+                "unsupported output name"
+            );
+            fixed.push(name.clone());
+        }
+        if fixed.is_empty() {
+            return derivation_output_names(value, job);
+        }
+        let fields = fixed
+            .iter()
+            .map(|name| format!("{name:?} = (builtins.getAttr {name:?} d).outPath;"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let expr = format!("let d = import {}; in {{ {fields} }}", job.drv_path);
+        let resolved: BTreeMap<String, String> =
+            serde_json::from_reader(self.nix_output(dir, &["eval", "--json", "--expr", &expr])?)?;
+        ensure!(
+            resolved.len() == fixed.len() && fixed.iter().all(|name| resolved.contains_key(name)),
+            "fixed-CA resolver output names mismatch"
+        );
+        let mut value = value.clone();
+        for name in fixed {
+            let path = resolved[&name]
+                .strip_prefix("/nix/store/")
+                .context("fixed-CA resolver returned non-store path")?;
+            value["derivations"][basename]["outputs"][name] = serde_json::json!({"path": path});
+        }
+        derivation_output_names(&value, job)
+    }
+
+    fn deliver(
+        &self,
+        http: &Client,
+        dir: &Path,
+        job: &Job,
+        failures: &mut BlobFailures,
+    ) -> Result<()> {
         let registry = base_url(&self.registry_url)?;
         let blob = base_url(&self.blob_url)?;
         let derivation: serde_json::Value =
             serde_json::from_reader(self.nix_output(dir, &["derivation", "show", &job.drv_path])?)?;
-        let names = derivation_output_names(&derivation, job)?;
+        let timestamp = now()?;
+        let names = self
+            .output_names(dir, &derivation, job)
+            .map_err(|error| RetryAfter {
+                next_attempt: timestamp.saturating_add(3600),
+                message: format!(
+                    "unsupported/unresolved derivation retained for operator recovery: {error:#}"
+                ),
+            })?;
         let args: Vec<&str> = ["path-info", "--json", "--recursive"]
             .into_iter()
             .chain(job.outputs.iter().map(String::as_str))
@@ -372,46 +544,96 @@ impl Sender {
                     "Nix recursive closure omitted reference {reference}"
                 );
             }
-            let mut nar = self.nix_output(dir, &["store", "dump-path", path])?;
-            let mut hash = Sha256::new();
-            let mut buffer = [0u8; 65536];
-            let mut size = 0u64;
-            loop {
-                let count = nar.read(&mut buffer)?;
-                if count == 0 {
-                    break;
-                }
-                hash.update(&buffer[..count]);
-                size += count as u64;
-            }
-            let key = format!("{:x}", hash.finalize());
             let expected: NixHash = info.nar_hash.parse()?;
-            let actual: NixHash = format!("sha256:{key}").parse()?;
-            ensure!(
-                actual == expected && size == info.nar_size,
-                "dump-path does not match Nix path-info for {path}"
-            );
+            let key = expected
+                .to_nix_base16_string()
+                .strip_prefix("sha256:")
+                .context("SHA256 required")?
+                .to_owned();
             let artifact = Artifact {
                 file_hash: key.clone(),
-                file_size: size,
+                file_size: info.nar_size,
                 compression: "none".into(),
             };
             let url = format!("{blob}/nar/{key}.nar");
-            nar.seek(SeekFrom::Start(0))?;
-            http.put(&url)
-                .body(nar.as_file().try_clone()?)
-                .send()?
-                .error_for_status()?;
-            // The immutable, hash-validated backend is trusted; read back the exact key and size.
-            let head = http.head(&url).send()?.error_for_status()?;
-            ensure!(
-                head.headers()
-                    .get(reqwest::header::CONTENT_LENGTH)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<u64>().ok())
-                    == Some(size),
-                "uploaded blob readback size mismatch"
-            );
+            failures.check(&key, now()?)?;
+            let transfer = (|| -> Result<()> {
+                let head = http.head(&url).send()?;
+                if head.status() == reqwest::StatusCode::OK {
+                    ensure!(
+                        head.headers()
+                            .get(reqwest::header::CONTENT_LENGTH)
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|v| v.parse::<u64>().ok())
+                            == Some(info.nar_size),
+                        "stored blob preflight size mismatch"
+                    );
+                    // Only this exact, single capability promises file + parent fsync.
+                    // Legacy presence is not a durable acknowledgement: validate and PUT.
+                    let mut durable = head.headers().get_all("x-repro2-durable").iter();
+                    if durable.next().is_some_and(|v| v == "file-and-parent-v1")
+                        && durable.next().is_none()
+                    {
+                        return Ok(());
+                    }
+                }
+                ensure!(
+                    head.status() == reqwest::StatusCode::NOT_FOUND
+                        || head.status() == reqwest::StatusCode::OK,
+                    "blob preflight failed: {}",
+                    head.status()
+                );
+                let mut nar = self.nix_output(dir, &["store", "dump-path", path])?;
+                let mut hash = Sha256::new();
+                let mut buffer = [0u8; 65536];
+                let mut size = 0u64;
+                loop {
+                    let count = nar.read(&mut buffer)?;
+                    if count == 0 {
+                        break;
+                    }
+                    hash.update(&buffer[..count]);
+                    size += count as u64;
+                }
+                let key = format!("{:x}", hash.finalize());
+                let actual: NixHash = format!("sha256:{key}").parse()?;
+                ensure!(
+                    actual == expected && size == info.nar_size,
+                    "dump-path does not match Nix path-info for {path}"
+                );
+                nar.seek(SeekFrom::Start(0))?;
+                let uploaded = http
+                    .put(&url)
+                    .timeout(Duration::from_secs(self.transfer_timeout_secs))
+                    .body(nar.as_file().try_clone()?)
+                    .send()?
+                    .error_for_status()?;
+                ensure!(
+                    uploaded.status().is_success(),
+                    "blob upload acknowledgement not successful"
+                );
+                // The immutable, hash-validated backend is trusted; read back the exact key and size.
+                let head = http.head(&url).send()?.error_for_status()?;
+                ensure!(
+                    head.status() == reqwest::StatusCode::OK,
+                    "uploaded blob readback not OK"
+                );
+                ensure!(
+                    head.headers()
+                        .get(reqwest::header::CONTENT_LENGTH)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<u64>().ok())
+                        == Some(size),
+                    "uploaded blob readback size mismatch"
+                );
+                Ok(())
+            })();
+            match transfer {
+                Ok(()) => {
+                    failures.0.remove(&key);
+                }
+                Err(error) => return Err(failures.failed(key, now()?, error)),
+            }
             artifacts.insert(path.clone(), (metadata, artifact));
         }
         // Only paths actually named by this build's hook cast reports. Closure copies never do.
@@ -435,15 +657,24 @@ impl Sender {
                 metadata,
                 artifact,
             };
-            http.post(format!("{registry}/build-reports"))
+            let acknowledged = http
+                .post(format!("{registry}/build-reports"))
                 .json(&report)
                 .send()?
                 .error_for_status()?;
-            let records: Vec<serde_json::Value> = http
+            ensure!(
+                acknowledged.status().is_success(),
+                "registry acknowledgement not successful"
+            );
+            let readback = http
                 .get(format!("{registry}/nar-info/{store_path_hash}"))
                 .send()?
-                .error_for_status()?
-                .json()?;
+                .error_for_status()?;
+            ensure!(
+                readback.status() == reqwest::StatusCode::OK,
+                "registry readback not OK"
+            );
+            let records: Vec<serde_json::Value> = readback.json()?;
             let canonical = info.nar_hash.parse::<NixHash>()?.to_sri_string();
             let mut expected = serde_json::to_value(&report)?;
             expected["nar_hash"] = canonical.into();
@@ -469,6 +700,38 @@ impl Sender {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn blob_failure_circuit_is_bounded_and_backoff_does_not_evict_live_failures() {
+        let mut failures = BlobFailures::default();
+        for n in 0..MAX_BLOB_FAILURES {
+            let key = n.to_string();
+            failures.check(&key, 100).unwrap();
+            let error = failures.failed(key, 100, anyhow::anyhow!("offline"));
+            assert_eq!(
+                error.downcast_ref::<RetryAfter>().unwrap().next_attempt,
+                160
+            );
+        }
+        let error = failures.check("overflow", 100).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<RetryAfter>().unwrap().next_attempt,
+            160
+        );
+        assert_eq!(failures.0.len(), MAX_BLOB_FAILURES);
+        assert!(failures.check("0", 159).is_err());
+        for (now, next) in [(160, 280), (280, 520), (520, 820), (820, 1120)] {
+            failures.check("0", now).unwrap();
+            let error = failures.failed("0".into(), now, anyhow::anyhow!("offline"));
+            assert_eq!(
+                error.downcast_ref::<RetryAfter>().unwrap().next_attempt,
+                next
+            );
+        }
+        failures.check("overflow", 160).unwrap();
+        let _ = failures.failed("overflow".into(), 160, anyhow::anyhow!("offline"));
+        assert_eq!(failures.0.len(), MAX_BLOB_FAILURES);
+    }
 
     const DRV: &str = "/nix/store/y1a49lg2ja68djssigz14lhdxvxcwbxa-example.drv";
     const OUT: &str = "/nix/store/y1a49lg2ja68djssigz14lhdxvxcwbxa-example";

@@ -4,6 +4,7 @@ Run: REPRO2_REAL_NIX=/absolute/path/to/nix python3 tests/nix_sender_slice.py
 No host installation, daemon, config, authentication, or live service changes.
 TEST-ONLY proxy injects Alice identity; N=1 is deliberate for this one-builder smoke.
 """
+import base64
 import hashlib
 import json
 import os
@@ -13,6 +14,7 @@ import subprocess
 import tempfile
 import threading
 from http.server import ThreadingHTTPServer
+from urllib.request import Request
 from sender_slice import TestIdentityProxy, SENDER, wait_for
 from http_slice import HTTP, ROOT, REGISTRY, GATEWAY, ready, request
 
@@ -82,7 +84,7 @@ def main():
                 worker = subprocess.Popen(run, env=env, stdout=logs, stderr=logs)
                 children.append(worker)
                 try:
-                    wait_for(lambda: not list(spool.glob("*/job.json")), "real Nix restarted worker failed to drain", timeout=20)
+                    wait_for(lambda: not list(spool.glob("*/job.json")), "real Nix restarted worker failed to drain", timeout=90)
                 except AssertionError:
                     logs.flush()
                     raise AssertionError((tmp / "services.log").read_text())
@@ -109,10 +111,48 @@ def main():
                 assert blocked.returncode != 0 and dep_hash in blocked.stderr, blocked.stderr
                 worker.terminate()
                 worker.wait(timeout=5)
+                # Nix 2.34.8 fixed-CA v4 outputs have {method, hash}, not path.
+                # Exercise the actual resolver, NAR dump, publication and acknowledgement.
+                fixed_expr = 'builtins.derivation { name = "real-repro2-fixed-ca"; system = "x86_64-linux"; builder = "/usr/bin/bash"; outputHashAlgo = "sha256"; outputHashMode = "flat"; outputHash = builtins.hashString "sha256" "fixed bytes"; testRoot = ' + json.dumps(str(local)) + '; args = [ "-c" "printf \'fixed bytes\' > $testRoot$out" ]; }'
+                fixed = json.loads(nix(["--option", "post-build-hook", str(hook), "build", "--no-link", "--json", "--expr", fixed_expr]))[0]
+                fixed_json = json.loads(nix(["derivation", "show", fixed["drvPath"]]))
+                assert fixed_json["version"] == 4
+                fixed_spec = fixed_json["derivations"][Path(fixed["drvPath"]).name]["outputs"]["out"]
+                assert set(fixed_spec) == {"method", "hash"}, fixed_spec
+                subprocess.run([*run, "--once"], env=env, stdout=logs, stderr=logs, check=True)
+                fixed_out = fixed["outputs"]["out"]
+                fixed_hash = Path(fixed_out).name.split("-", 1)[0]
+                fixed_rows = json.loads(request(f"{REGISTRY}/nar-info/{fixed_hash}")[1])
+                assert len(fixed_rows) == 1 and fixed_rows[0]["output_name"] == "out"
+                assert not list(spool.glob("*/job.json")) and not list(roots.iterdir())
+                # Re-enqueue a distinct job over an already delivered closure. A real
+                # Nix wrapper rejects ANY dump, so HEAD presence must precede it.
+                subprocess.run([str(SENDER), "--spool", str(spool), "--gc-roots", str(roots), "hook"],
+                               env={**env, "DRV_PATH": drv, "OUT_PATHS": " ".join(outputs.values())}, check=True)
+                no_dump = tmp / "nix-no-dump"
+                no_dump.write_text("#!/usr/bin/bash\ncase \"$*\" in *dump-path*) exit 99;; esac\nexec " + shlex.quote(binary) + " \"$@\"\n")
+                no_dump.chmod(0o700)
+                replay = [str(no_dump) if item == binary else item for item in run]
+                # Only replace --nix's value; the selected binary is not the sender.
+                replay[replay.index("--nix") + 1] = str(no_dump)
+                for info in infos.values():
+                    # Check the actual server/proxy capability, not just claimed size.
+                    digest = info["narHash"]
+
+                    key = base64.b64decode(digest.removeprefix("sha256-")).hex()
+                    with HTTP.open(Request(base + "/blob/nar/" + key + ".nar", method="HEAD")) as response:
+                        assert response.headers.get_all("X-Repro2-Durable") == ["file-and-parent-v1"]
+                        assert int(response.headers["Content-Length"]) == info["narSize"]
+                before = len(TestIdentityProxy.calls)
+                subprocess.run([*replay, "--once"], env=env, stdout=logs, stderr=logs, check=True)
+                replay_calls = TestIdentityProxy.calls[before:]
+                assert sum(method == "HEAD" for method, _ in replay_calls) == len(infos)
+                assert not any(method == "PUT" for method, _ in replay_calls), replay_calls
+                assert not list(spool.glob("*/job.json")) and not list(roots.iterdir())
                 nix(["store", "gc"])
                 absent = subprocess.run([*common_nix, "--store", store, "path-info", outputs["dev"]], capture_output=True)
                 assert absent.returncode != 0, "delivered outputs remain artificially GC rooted"
-                print("REAL Nix slice PASS: 2.24 build automatically invoked hook; multioutput/deriver/references; actual GC retention; real path-info/dump; SIGKILL/restart/retry; actual registry/file-server/gateway; dev output imported via nix copy with matching hash/content; GC releases after success.")
+                print("REAL Nix slice PASS: 2.34.8 build automatically invoked hook; multioutput/deriver/references; actual GC retention; real path-info/dump; SIGKILL/restart/backoff; actual registry/file-server/gateway; named fixed-CA output resolved by actual Nix and acknowledged; pre-existing closure delivered with dump forbidden and zero PUTs; dev output imported via nix copy with matching hash/content; GC releases after success.")
                 print("BOUNDARY: isolated diverted local stores + host Bash builder; no daemon; TEST-ONLY identity proxy; N=1 smoke, no independent rebuild/auth proof. Dependency blob delivered but full out closure correctly blocked by its missing per-path votes. Consumer explicitly trusts unsigned gateway (require-sigs=false).")
     finally:
         if proxy:

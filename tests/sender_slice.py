@@ -65,6 +65,8 @@ class TestIdentityProxy(BaseHTTPRequestHandler):
             data = response.read()
             self.send_response(response.code)
             self.send_header("Content-Length", response.headers.get("Content-Length", str(len(data))))
+            for value in response.headers.get_all("X-Repro2-Durable", []):
+                self.send_header("X-Repro2-Durable", value)
             self.end_headers()
             if self.command != "HEAD":
                 self.wfile.write(data)
@@ -152,7 +154,8 @@ def main():
                 TestIdentityProxy.blocked = False
                 worker = subprocess.Popen(run, env=env, stdout=logs, stderr=logs)
                 children.append(worker)
-                wait_for(lambda: not list(spool.glob("*/job.json")), "restart failed to drain retained job")
+                # The per-blob failure deadline survives restart in retry.json (60s).
+                wait_for(lambda: not list(spool.glob("*/job.json")), "restart failed to drain retained job", timeout=90)
                 assert not list(roots.iterdir()), "successful publication leaked roots"
                 assert worker.poll() is None, "normal workflow not resident"
                 rows = json.loads(request(f"{REGISTRY}/nar-info/{HASH}")[1])

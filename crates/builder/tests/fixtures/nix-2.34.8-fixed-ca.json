@@ -1,0 +1,15 @@
+{
+  "derivations": {
+    "dwmaawkaqz3zlq5m1jvnjf7b4d59kpbm-repro2-fixed-ca-probe.drv": {
+      "name": "repro2-fixed-ca-probe",
+      "outputs": {
+        "out": {
+          "hash": "sha256-iu/6PtDjXIQiraSO4bja8bVvKTyvHjEundZPZ4tF7yU=",
+          "method": "flat"
+        }
+      },
+      "version": 4
+    }
+  },
+  "version": 4
+}
